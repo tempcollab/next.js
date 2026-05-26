@@ -1,0 +1,9 @@
+{
+  "name": "audit-edge-app",
+  "private": true,
+  "dependencies": {
+    "next": "16.3.0-canary.29",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}
