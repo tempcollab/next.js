@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This audit examined Next.js commit `007051470157d38058730ffa0a1983d4b4106424` (v16.3.0-canary.29) for security vulnerabilities. Ten issues were identified and confirmed against live instances in a Docker-based test environment:
+This audit examined Next.js commit `007051470157d38058730ffa0a1983d4b4106424` (v16.3.0-canary.29) for security vulnerabilities. Eleven issues were identified and confirmed against live instances in a Docker-based test environment:
 
 | ID | Title | Severity |
 |----|-------|----------|
@@ -16,8 +16,9 @@ This audit examined Next.js commit `007051470157d38058730ffa0a1983d4b4106424` (v
 | VULN-8 | Middleware Rewrite SSRF with Credential Forwarding to Arbitrary Hosts | High |
 | VULN-9 | DNS Rebinding Bypass of blockCrossSiteDEV (dev mode) | High |
 | VULN-10 | Edge Runtime Server Action Unbounded Body (DoS) | High |
+| VULN-11 | SSR Bypass via x-middleware-prefetch Header Injection | High |
 
-All ten vulnerabilities are independently reproducible using the provided exploit scripts.
+All eleven vulnerabilities are independently reproducible using the provided exploit scripts.
 
 ---
 
@@ -661,6 +662,75 @@ Add body size enforcement to the edge runtime path in `action-handler.ts`. Befor
 
 ---
 
+## VULN-11: SSR Bypass via x-middleware-prefetch Header Injection
+
+**Severity:** High
+
+**Affected Code:**
+- `packages/next/src/server/lib/server-ipc/utils.ts:42-54` — `INTERNAL_HEADERS` list does not include `x-middleware-prefetch`; `filterInternalHeaders()` at `router-server.ts:231` therefore does not strip it from external requests
+- `packages/next/src/server/base-server.ts:2171-2183` — prefetch bail-out: when `!isSSG && req.headers['x-middleware-prefetch']` is truthy and the page is not a 404/error page, the server short-circuits: returns HTTP 200 with body `{}`, sets `x-matched-path` and `x-middleware-skip` response headers, and skips all server-side rendering
+
+**Root Cause:**
+
+`x-middleware-prefetch` is an internal header set by Next.js's client-side router during prefetch requests. It is not in the `INTERNAL_HEADERS` filter list in `server-ipc/utils.ts`, so external clients can inject it freely. When present on a request to any dynamically rendered (non-SSG) page that is not a 404 or error page, the server at `base-server.ts:2171-2183` short-circuits entirely:
+
+```typescript
+// base-server.ts:2171-2183
+if (
+  !isSSG &&
+  req.headers['x-middleware-prefetch'] &&
+  !(is404Page || pathname === '/_error')
+) {
+  res.setHeader(MATCHED_PATH_HEADER, pathname)
+  res.setHeader('x-middleware-skip', '1')
+  res.setHeader('cache-control', 'private, no-cache, no-store, max-age=0, must-revalidate')
+  res.body('{}').send()
+  return null
+}
+```
+
+All server-side rendering is skipped: server components, `getServerSideProps`, any auth checks, any SSR side effects (logging, rate limiting, analytics). The `x-matched-path` response header additionally leaks the matched route pattern.
+
+**Attack Scenario:**
+
+A Next.js production application has protected pages that enforce authentication inside server components (e.g., reading session cookies via `await cookies()`). This is a common pattern — the `/protected` page in this audit's test app follows it exactly. An external attacker sends any request with the `x-middleware-prefetch: 1` header. The server returns `{}` without executing the auth check: no logging, no rate limiting, no authorization checks. While protected content is not directly exfiltrated (the body is `{}`), the auth logic is completely bypassed.
+
+The `x-matched-path` response header additionally functions as a route existence oracle: an attacker can probe any path and observe whether `x-matched-path` is returned in the response to enumerate hidden or internal routes.
+
+**Reproduction Steps:**
+
+```bash
+# Negative control — normal request renders the page via SSR
+curl -s "http://localhost:3000/protected"
+# Expected: body contains "Access Denied" (SSR executed, auth check ran)
+
+# Positive exploit — x-middleware-prefetch bypasses SSR entirely
+curl -s -D /tmp/vuln11_headers.txt -o /tmp/vuln11_body.txt \
+  -H "x-middleware-prefetch: 1" \
+  "http://localhost:3000/protected"
+# Expected: body is exactly "{}" (SSR skipped, auth check never executed)
+
+# Route oracle — x-matched-path header leaks route pattern
+grep -i "x-matched-path" /tmp/vuln11_headers.txt
+# Expected: x-matched-path: /protected
+
+# x-middleware-skip confirms bypass mechanism
+grep -i "x-middleware-skip" /tmp/vuln11_headers.txt
+# Expected: x-middleware-skip: 1
+```
+
+**Evidence:**
+- Normal request to `/protected` returns `Access Denied` — SSR executed correctly
+- Request with `x-middleware-prefetch: 1` returns `{}` — SSR completely bypassed, auth check skipped
+- Response header `x-matched-path: /protected` — route oracle confirmed
+- Response header `x-middleware-skip: 1` — internal bypass mechanism header leaked
+
+**Remediation:**
+
+Add `x-middleware-prefetch` to the `INTERNAL_HEADERS` array in `packages/next/src/server/lib/server-ipc/utils.ts`. This ensures the header is stripped from all incoming external requests before any processing, while still allowing legitimate internal prefetch requests from Next.js's own client-side router to function correctly (those requests are generated server-side and do not pass through the external header filter).
+
+---
+
 ## Appendix: Test Environment
 
 ```
@@ -676,7 +746,7 @@ audit-net (Docker bridge network)
   +-- audit-credential-capture (9091:9091) — logs captured Cookie+Authorization headers
 ```
 
-To reproduce all findings:
+To reproduce all 11/11 findings (VULN-11 reuses the existing `audit-nextjs-app` container on port 3000; no additional infrastructure is needed):
 ```bash
 bash autofyn_audit/setup.sh
 bash autofyn_audit/run_all_exploits.sh
