@@ -12,33 +12,36 @@ echo ""
 bash "$SCRIPT_DIR/teardown.sh" 2>/dev/null || true
 
 # Create network
-echo "[1/10] Creating Docker network..."
+echo "[1/11] Creating Docker network..."
 docker network create audit-net 2>/dev/null || true
 
 # Build images
-echo "[2/10] Building secret server..."
+echo "[2/11] Building secret server..."
 docker build -t audit-secret-server "$SCRIPT_DIR/secret_server/"
 
-echo "[3/10] Building redirect server..."
+echo "[3/11] Building redirect server..."
 docker build -t audit-redirect-server "$SCRIPT_DIR/redirect_server/"
 
-echo "[4/10] Building vulnerable Next.js app (production)..."
+echo "[4/11] Building vulnerable Next.js app (production)..."
 docker build -t audit-nextjs-app "$SCRIPT_DIR/vulnerable_app/"
 
-echo "[5/10] Building vulnerable Next.js dev app (webpack dev mode)..."
+echo "[5/11] Building vulnerable Next.js dev app (webpack dev mode)..."
 docker build -t audit-nextjs-dev "$SCRIPT_DIR/dev_app/"
 
-echo "[6/10] Building credential capture server..."
+echo "[6/11] Building credential capture server..."
 docker build -t audit-credential-capture "$SCRIPT_DIR/credential_capture_server/"
 
-echo "[7/10] Building middleware app (production)..."
+echo "[7/11] Building middleware app (production)..."
 docker build -t audit-middleware-app "$SCRIPT_DIR/middleware_app/"
 
-echo "[8/10] Building edge runtime app (production)..."
+echo "[8/11] Building edge runtime app (production)..."
 docker build -t audit-edge-app "$SCRIPT_DIR/edge_app/"
 
+echo "[9/11] Building audit runner..."
+docker build -t audit-runner -f "$SCRIPT_DIR/Dockerfile.runner" "$SCRIPT_DIR"
+
 # Start containers
-echo "[9/10] Starting containers..."
+echo "[10/11] Starting containers..."
 docker run -d --name audit-secret-server --network audit-net -p 9090:9090 audit-secret-server
 docker run -d --name audit-redirect-server --network audit-net -p 8080:8080 audit-redirect-server
 docker run -d --name audit-nextjs-app --network audit-net -p 3000:3000 audit-nextjs-app
@@ -52,7 +55,7 @@ docker run -d --name audit-middleware-app --network audit-net -p 3003:3000 audit
 docker run -d --name audit-edge-app --network audit-net -p 3004:3000 audit-edge-app
 
 # Health checks — try container DNS names first (in-network), fall back to localhost (host)
-echo "[10/10] Waiting for services..."
+echo "[11/11] Waiting for services..."
 HEALTH_TARGETS=(
   "audit-secret-server:9090"
   "audit-redirect-server:8080"
@@ -84,7 +87,7 @@ done
 # Warm up the dev server — first request triggers webpack compilation (30-60s).
 # The health check above already does this, but a second request ensures compilation is complete.
 echo "  Warming up dev server webpack compilation (may take 30-60s)..."
-curl -s -o /dev/null "http://localhost:3002/" 2>/dev/null || true
+curl -s -o /dev/null "http://audit-nextjs-dev:3000/" 2>/dev/null || curl -s -o /dev/null "http://localhost:3002/" 2>/dev/null || true
 
 echo ""
 echo "=== Setup complete ==="
