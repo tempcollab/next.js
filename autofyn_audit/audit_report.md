@@ -345,12 +345,12 @@ autofyn_audit/
 ├── setup.sh / teardown.sh / run_all_exploits.sh
 ├── Dockerfile.runner
 ├── docs/
-│   ├── CVE-VULN-1.md              # Advisory: image optimizer SSRF
-│   ├── CVE-VULN-10.md             # Advisory: edge body limit
-│   ├── CVE-DEV-DNS-REBINDING.md   # Advisory: dev-mode DNS rebinding + impacts
-│   ├── hardening-VULN-7.md        # Hardening: x-forwarded-host trust
-│   ├── hardening-VULN-8.md        # Hardening: credential forwarding on rewrites
-│   └── hardening-VULN-11.md       # Hardening: x-middleware-prefetch SSR skip
+│   ├── NEXTJS-001.md    # Image optimizer SSRF via redirect (VULN-1)
+│   ├── NEXTJS-002.md    # Dev-mode DNS rebinding + file read (VULN-9/4/6)
+│   ├── NEXTJS-003.md    # Edge runtime unbounded body (VULN-10)
+│   ├── NEXTJS-004.md    # x-middleware-prefetch SSR skip + route oracle (VULN-11)
+│   ├── NEXTJS-005.md    # x-forwarded-host header trust (VULN-7)
+│   └── NEXTJS-006.md    # Credential forwarding on external rewrites (VULN-8)
 ├── exploits/
 │   ├── exploit_ssrf_redirect.sh
 │   ├── exploit_dev_file_read.sh
