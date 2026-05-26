@@ -12,36 +12,42 @@ echo ""
 bash "$SCRIPT_DIR/teardown.sh" 2>/dev/null || true
 
 # Create network
-echo "[1/6] Creating Docker network..."
+echo "[1/7] Creating Docker network..."
 docker network create audit-net 2>/dev/null || true
 
 # Build images
-echo "[2/6] Building secret server..."
+echo "[2/7] Building secret server..."
 docker build -t audit-secret-server "$SCRIPT_DIR/secret_server/"
 
-echo "[3/6] Building redirect server..."
+echo "[3/7] Building redirect server..."
 docker build -t audit-redirect-server "$SCRIPT_DIR/redirect_server/"
 
-echo "[4/6] Building vulnerable Next.js app..."
+echo "[4/7] Building vulnerable Next.js app (production)..."
 docker build -t audit-nextjs-app "$SCRIPT_DIR/vulnerable_app/"
 
+echo "[5/7] Building vulnerable Next.js dev app (webpack dev mode)..."
+docker build -t audit-nextjs-dev "$SCRIPT_DIR/dev_app/"
+
 # Start containers
-echo "[5/6] Starting containers..."
+echo "[6/7] Starting containers..."
 docker run -d --name audit-secret-server --network audit-net -p 9090:9090 audit-secret-server
 docker run -d --name audit-redirect-server --network audit-net -p 8080:8080 audit-redirect-server
 docker run -d --name audit-nextjs-app --network audit-net -p 3000:3000 audit-nextjs-app
 docker run -d --name audit-nextjs-app-test-headers --network audit-net -p 3001:3000 \
   -e NEXT_PRIVATE_TEST_HEADERS=1 audit-nextjs-app
+# Dev container: HTTP on 3002, inspector on 9230 (mapped from 9229 inside container)
+docker run -d --name audit-nextjs-dev --network audit-net -p 3002:3000 -p 9230:9229 audit-nextjs-dev
 
 # Health checks — try container DNS names first (in-network), fall back to localhost (host)
-echo "[6/6] Waiting for services..."
+echo "[7/7] Waiting for services..."
 HEALTH_TARGETS=(
   "audit-secret-server:9090"
   "audit-redirect-server:8080"
   "audit-nextjs-app:3000"
   "audit-nextjs-app-test-headers:3000"
+  "audit-nextjs-dev:3000"
 )
-LOCALHOST_PORTS=(9090 8080 3000 3001)
+LOCALHOST_PORTS=(9090 8080 3000 3001 3002)
 
 for idx in "${!HEALTH_TARGETS[@]}"; do
   target="${HEALTH_TARGETS[$idx]}"
@@ -58,6 +64,11 @@ for idx in "${!HEALTH_TARGETS[@]}"; do
     sleep 2
   done
 done
+
+# Warm up the dev server — first request triggers webpack compilation (30-60s).
+# The health check above already does this, but a second request ensures compilation is complete.
+echo "  Warming up dev server webpack compilation (may take 30-60s)..."
+curl -s -o /dev/null "http://localhost:3002/" 2>/dev/null || true
 
 echo ""
 echo "=== Setup complete ==="
