@@ -2,23 +2,22 @@
 
 ## Executive Summary
 
-This audit examined Next.js commit `007051470157d38058730ffa0a1983d4b4106424` (v16.3.0-canary.29) for security vulnerabilities. Eleven issues were identified and confirmed against live instances in a Docker-based test environment:
+This audit examined Next.js commit `007051470157d38058730ffa0a1983d4b4106424` (v16.3.0-canary.29) for security vulnerabilities. Eight issues were identified and confirmed against live instances in a Docker-based test environment:
 
-| ID | Title | Severity |
-|----|-------|----------|
-| VULN-1 | SSRF via Image Optimizer Redirect (remotePatterns bypass) | High |
-| VULN-2 | Auth Bypass via Internal Header Injection (NEXT_PRIVATE_TEST_HEADERS) | High |
-| VULN-3 | Server Actions Execute Without Origin Header (defense-in-depth gap) | Medium |
-| VULN-4 | Arbitrary File Read via Source Map Endpoint (webpack dev server) | High |
-| VULN-5 | Unauthenticated V8 Inspector Open via Dev Endpoint | High |
-| VULN-6 | Path Traversal in launch-editor via isAppRelativePath | Medium |
-| VULN-7 | Server Action CSRF Bypass via x-forwarded-host Header Injection | High |
-| VULN-8 | Middleware Rewrite SSRF with Credential Forwarding to Arbitrary Hosts | High |
-| VULN-9 | DNS Rebinding Bypass of blockCrossSiteDEV (dev mode) | High |
-| VULN-10 | Edge Runtime Server Action Unbounded Body (DoS) | Medium |
-| VULN-11 | Route Oracle and SSR Skip via Unfiltered x-middleware-prefetch Header | High |
+| ID | Title | Severity | Mode |
+|----|-------|----------|------|
+| VULN-1 | SSRF via Image Optimizer Redirect (remotePatterns bypass) | High | Production |
+| VULN-4 | Arbitrary File Read via Source Map Endpoint (webpack dev server) | Medium | Dev only |
+| VULN-6 | Path Traversal in launch-editor via isAppRelativePath | Medium | Dev only |
+| VULN-7 | Server Action CSRF Bypass via x-forwarded-host Header Injection | Medium | Production |
+| VULN-8 | Middleware Rewrite SSRF with Credential Forwarding to Arbitrary Hosts | Medium | Production |
+| VULN-9 | DNS Rebinding Bypass of blockCrossSiteDEV (dev mode) | Medium | Dev only |
+| VULN-10 | Edge Runtime Server Action Unbounded Body (DoS) | Medium | Production (edge) |
+| VULN-11 | Route Oracle and SSR Skip via Unfiltered x-middleware-prefetch Header | Medium | Production |
 
-All eleven vulnerabilities are independently reproducible using the provided exploit scripts. Three end-to-end exploit chains (CHAIN-1 through CHAIN-3) combine individual vulnerabilities into complete attack scenarios — credential theft to account takeover, browser visit to full RCE, and route discovery to SSRF pivot — demonstrating critical real-world impact that cannot be dismissed as hypothetical.
+One exploit chain (CHAIN-1) combines VULN-8 and VULN-7 into a credential theft → account takeover scenario. An informational note on Server Actions' missing-Origin allowance (documented intentional behavior) is included in the appendix.
+
+All eight vulnerabilities are independently reproducible using the provided exploit scripts. Findings removed during verification (VULN-2, VULN-3, VULN-5) and chains removed (CHAIN-2, CHAIN-3) are documented in the Verification Notes appendix with rationale.
 
 ---
 
@@ -86,141 +85,9 @@ Alternatively, use `redirect: 'follow'` in the initial `fetch()` call only after
 
 ---
 
-## VULN-2: Auth Bypass via Internal Header Injection (NEXT_PRIVATE_TEST_HEADERS)
-
-**Severity:** High (requires `NEXT_PRIVATE_TEST_HEADERS` env var to be set in production — a configuration error, not a default-state vulnerability)
-
-**Affected Code:**
-- `packages/next/src/server/lib/router-server.ts:230` — conditional skip of `filterInternalHeaders`
-- `packages/next/src/server/lib/server-ipc/utils.ts:42-64` — `INTERNAL_HEADERS` list and `filterInternalHeaders` implementation
-- `packages/next/src/server/async-storage/request-store.ts:117-143` — `mergeMiddlewareCookies` reads `x-middleware-set-cookie` from request headers
-
-**Root Cause:**
-
-`router-server.ts` calls `filterInternalHeaders(req.headers)` to strip internal Next.js headers from incoming requests before processing. This is the primary security boundary preventing external callers from spoofing internal headers. The bypass:
-
-```typescript
-// router-server.ts:230
-if (!process.env.NEXT_PRIVATE_TEST_HEADERS) {
-  filterInternalHeaders(req.headers)
-}
-```
-
-When the env var `NEXT_PRIVATE_TEST_HEADERS=1` is set, all internal header filtering is skipped. An external client can then send `x-middleware-set-cookie` with arbitrary cookie values. `mergeMiddlewareCookies` in `request-store.ts` reads this header and merges it into the `cookies()` store, making the attacker-controlled values available to any code that calls `await cookies()`.
-
-**Attack Scenario:**
-
-A developer or CI pipeline accidentally sets `NEXT_PRIVATE_TEST_HEADERS=1` in a production or staging environment. An external attacker sends:
-
-```
-x-middleware-set-cookie: session=admin_session_token; Path=/
-```
-
-Any server component reading `cookies().get('session')` now sees `admin_session_token`, bypassing session-based authentication entirely.
-
-**Reproduction Steps:**
-
-```bash
-# Normal app (port 3000) — header is filtered, shows Access Denied
-curl -s \
-  -H 'x-middleware-set-cookie: session=admin_session_token; Path=/' \
-  'http://localhost:3000/protected'
-# Expected: contains "Access Denied"
-
-# Test-headers app (port 3001, NEXT_PRIVATE_TEST_HEADERS=1) — header passes through
-curl -s \
-  -H 'x-middleware-set-cookie: session=admin_session_token; Path=/' \
-  'http://localhost:3001/protected'
-# Expected: contains "ADMIN_SECRET_DATA: launch_codes_42"
-```
-
-**Evidence:**
-- Port 3000 (normal): returns `Access Denied` regardless of injected headers
-- Port 3001 (`NEXT_PRIVATE_TEST_HEADERS=1`): returns `ADMIN_SECRET_DATA: launch_codes_42` with injected session cookie
-
-**Remediation:**
-
-`NEXT_PRIVATE_TEST_HEADERS` must never be set in production or staging environments. Its name already signals test-only usage, but the risk should be documented explicitly. Consider:
-
-1. Adding a startup warning when `NEXT_PRIVATE_TEST_HEADERS` is set and `NODE_ENV` is `production`.
-2. Restricting the bypass further — e.g., only allow it when also in `NODE_ENV=test` or when a specific CI flag is set.
-3. Documenting `NEXT_PRIVATE_TEST_HEADERS` as a security-sensitive variable in the framework's environment variable documentation.
-
----
-
-## VULN-3: Server Actions Execute Without Origin Header (defense-in-depth gap)
-
-**Severity:** Medium
-
-**Affected Code:**
-- `packages/next/src/server/app-render/action-handler.ts:646-651` — explicit allowance for requests without `origin` header
-- `packages/next/src/server/app-render/action-handler.ts:1388` — `ACTION_ID_EXPECTED_LENGTH = 42`
-
-**Root Cause:**
-
-The CSRF protection in Server Actions checks the `origin` header against the `host`/`x-forwarded-host` header. When no `origin` header is present, the code logs a warning but allows the action to proceed:
-
-```typescript
-// action-handler.ts:646-651
-if (!originHost) {
-  // This is a handcrafted request without an origin or a request from an unsafe browser.
-  // We'll let this through but log a warning.
-  // We can't guard against unsafe browsers and handcrafted requests can't contain
-  // user credentials that haven't been shared willingly.
-  warning = 'Missing `origin` header from a forwarded Server Actions request.'
-}
-```
-
-This is an explicitly documented design decision. The logic is that handcrafted requests (curl, scripts) cannot obtain user credentials without cooperation; only browser-originated cross-site requests — which always include an `Origin` header — pose real CSRF risk.
-
-**Important caveat:** This behavior is intentional. The comment in the source code accurately describes the threat model. A standard browser-based CSRF attack will always send an `Origin` header, and the check handles that case. This is a defense-in-depth gap rather than an exploitable vulnerability in the traditional sense.
-
-**Residual risk scenario:**
-
-The gap becomes relevant in environments where:
-1. A compromised proxy or middleware strips or suppresses `Origin` headers before they reach Next.js, or
-2. A victim's credentials (cookies) are somehow already known to an attacker (e.g., via a separate leak), and the attacker wants to invoke server actions on the victim's behalf using a scripted request.
-
-In both cases, the attacker can invoke server actions without triggering CSRF protection, provided they also supply valid session credentials.
-
-**Reproduction Steps:**
-
-```bash
-# Extract action ID from built manifest (42 hex chars per ACTION_ID_EXPECTED_LENGTH)
-ACTION_ID=$(docker exec audit-nextjs-app \
-  cat /app/.next/server/server-reference-manifest.json \
-  | grep -oE '[0-9a-f]{42}' | head -1)
-
-# Invoke server action without Origin header
-curl -s -X POST \
-  -H "Next-Action: $ACTION_ID" \
-  -H "Content-Type: text/plain;charset=UTF-8" \
-  -H "Cookie: session=victim_session" \
-  --data '[]' \
-  'http://localhost:3000/'
-# Expected: HTTP 200, action executes, response contains session value
-```
-
-**Evidence:**
-- Action executes and returns HTTP 200 without `origin` header
-- Server logs show warning: `Missing 'origin' header from a forwarded Server Actions request`
-- With a mismatched `Origin` header, the action is rejected with "Invalid Server Actions request"
-
-**Remediation:**
-
-The current behavior is a deliberate trade-off. Options to improve defense-in-depth:
-
-1. **Require explicit opt-in for missing-origin allowance:** Add a framework config option (e.g., `serverActions.allowMissingOrigin: false`) to reject requests with no `Origin` header in production.
-2. **Document the threat model:** Add explicit documentation explaining why missing-origin requests are allowed and under what deployment conditions this becomes a risk (compromised proxies, credential-sharing scenarios).
-3. **Add stricter default for production:** Consider rejecting missing-origin requests by default in production mode (`NODE_ENV=production`) and allowing them only in development.
-
----
-
----
-
 ## VULN-4: Arbitrary File Read via Source Map Endpoint (webpack dev server)
 
-**Severity:** High
+**Severity:** Medium (dev mode only — this endpoint is not registered in production builds)
 
 **Affected Code:**
 - `packages/next/src/server/dev/middleware-webpack.ts:697-710` — `/__nextjs_source-map` handler, user-controlled `filename` with no validation
@@ -268,60 +135,6 @@ curl -s 'http://localhost:3002/__nextjs_source-map?filename=/tmp/chain_etc_passw
 **Remediation:**
 
 Restrict the `filename` parameter to paths within the project root (or the webpack compilation output directory). Validate that the resolved path starts with the Next.js root directory before calling `fs.readFile`. Apply the same check to the resolved `sourceMappingURL` target path. Alternatively, only serve source maps for modules that are actually tracked in the webpack module graph, rejecting requests for arbitrary filesystem paths.
-
----
-
-## VULN-5: Unauthenticated V8 Inspector Open via Dev Endpoint
-
-**Severity:** High
-
-**Affected Code:**
-- `packages/next/src/next-devtools/server/attach-nodejs-debugger-middleware.ts:13-43` — `/__nextjs_attach-nodejs-inspector` handler, no authentication, calls `inspector.open(debugPort)` unconditionally
-
-**Root Cause:**
-
-The `/__nextjs_attach-nodejs-inspector` endpoint is registered by both webpack and Turbopack hot-reloaders. It accepts GET requests from any caller (no authentication, no method restriction, no Origin check). When called, it:
-
-1. Calls `inspector.open(debugPort)` to start the V8 inspector if it is not already running.
-2. Fetches `http://{inspectorURL.host}/json/list` from the now-running inspector.
-3. Returns the first debug target's `devtoolsFrontendUrl` in a JSON response.
-
-Any caller who can reach the dev server port can force the V8 inspector open and obtain the WebSocket debugger URL. From there, CDP `Runtime.evaluate` can execute arbitrary JavaScript in the Node.js process — reading environment variables, filesystem contents, making network calls, or spawning child processes.
-
-**Severity note:** The default `inspector.open()` binding is `127.0.0.1:9229` (localhost only). On a local dev machine, this is reachable by any local process or a web page exploiting DNS rebinding on localhost. To simulate a network-accessible scenario (e.g., a container or VM exposed to a LAN), the PoC starts `next dev` with `NODE_OPTIONS='--inspect=0.0.0.0:9229'`. The core vulnerability — unauthenticated `inspector.open()` with no opt-in — exists regardless of binding address.
-
-**Attack Scenario:**
-
-A developer runs `next dev` on a machine accessible to other users or processes (shared dev server, LAN, CI environment). Any local process calls `GET /__nextjs_attach-nodejs-inspector`. The V8 inspector opens. The attacker connects via CDP WebSocket, sends `Runtime.evaluate` commands, and reads secrets from `process.env`, reads source files, or exfiltrates data. This requires no credentials and leaves no application-level log entry.
-
-**Reproduction Steps:**
-
-```bash
-# Step 1: Open inspector without authentication
-curl -s 'http://localhost:3002/__nextjs_attach-nodejs-inspector'
-# Expected: 200 JSON with devtoolsFrontendUrl
-
-# Step 2: Get WebSocket debugger URL
-curl -s 'http://localhost:9230/json/list'
-# Expected: JSON array with webSocketDebuggerUrl
-
-# Step 3: Execute arbitrary code via CDP
-WS_URL=$(curl -s 'http://localhost:9230/json/list' | grep -o '"ws://[^"]*"' | head -1 | tr -d '"')
-node autofyn_audit/exploits/inspector_rce.mjs "$WS_URL" "require('fs').readFileSync('/etc/passwd','utf-8')"
-# Expected: contents of /etc/passwd
-
-node autofyn_audit/exploits/inspector_rce.mjs "$WS_URL" "JSON.stringify(process.env)"
-# Expected: JSON object containing all environment variables including secrets
-```
-
-**Evidence:**
-- `/__nextjs_attach-nodejs-inspector` returns 200 with devtools URL without any credentials
-- CDP `Runtime.evaluate` successfully executes `fs.readFileSync('/etc/passwd')` — output includes `root:x:0:0:root`
-- CDP `Runtime.evaluate` returns `process.env` including `REACT_EDITOR` and all container environment variables
-
-**Remediation:**
-
-Gate the `/__nextjs_attach-nodejs-inspector` endpoint behind a check that the request originates from localhost (or from the same user session). Require an explicit opt-in environment variable (e.g., `NEXT_ENABLE_INSPECTOR=1`) rather than opening the inspector on any unauthenticated request. At minimum, validate the `Origin` header or require a secret token passed as a query parameter.
 
 ---
 
@@ -385,7 +198,7 @@ After computing `appPath`, validate that `path.resolve(nextRootDirectory, appPat
 
 ## VULN-7: Server Action CSRF Bypass via x-forwarded-host Header Injection
 
-**Severity:** High
+**Severity:** Medium (deployment-dependent — mitigated by reverse proxies that overwrite `x-forwarded-host`, and by browsers' default `SameSite=Lax` cookie policy)
 
 **Affected Code:**
 - `packages/next/src/server/app-render/action-handler.ts:482-518` — `parseHostHeader`: when called without `originDomain`, unconditionally returns `x-forwarded-host` value if present, prioritizing it over the `host` header
@@ -464,7 +277,7 @@ Option 3: Add a `serverActions.trustXForwardedHost` config flag (defaulting to `
 
 ## VULN-8: Middleware Rewrite SSRF with Credential Forwarding to Arbitrary Hosts
 
-**Severity:** High
+**Severity:** Medium (requires middleware that passes user-controlled input to `NextResponse.rewrite()` — a developer-introduced pattern, not a default framework vulnerability)
 
 **Affected Code:**
 - `packages/next/src/server/lib/router-utils/proxy-request.ts:25-36` — `proxyRequest`: creates `http-proxy` instance with `changeOrigin: true`; `http-proxy` forwards all original request headers (including `Cookie` and `Authorization`) to the target by default
@@ -524,7 +337,7 @@ Option 3: Document the credential-forwarding behavior prominently in the `NextRe
 
 ## VULN-9: DNS Rebinding Bypass of blockCrossSiteDEV (dev mode)
 
-**Severity:** High
+**Severity:** Medium (dev mode only — Chrome blocks via Private Network Access; exploitable in Firefox/Safari)
 
 **Affected Code:**
 - `packages/next/src/server/lib/router-utils/block-cross-site-dev.ts:116-175` — `blockCrossSiteDEV`: lines 169-174 allow all requests with no `Origin` header; the `Host` header is never validated
@@ -668,7 +481,7 @@ Add body size enforcement to the edge runtime path in `action-handler.ts`. Befor
 
 ## VULN-11: Route Oracle and SSR Skip via Unfiltered x-middleware-prefetch Header
 
-**Severity:** High
+**Severity:** Medium (no protected content is returned — body is always `{}`; the impact is SSR auth logic bypass and route pattern disclosure via `x-matched-path` response header)
 
 **Affected Code:**
 - `packages/next/src/server/lib/server-ipc/utils.ts:42-54` — `INTERNAL_HEADERS` list does not include `x-middleware-prefetch`; `filterInternalHeaders()` at `router-server.ts:231` therefore does not strip it from external requests
@@ -737,19 +550,17 @@ Add `x-middleware-prefetch` to the `INTERNAL_HEADERS` array in `packages/next/sr
 
 ## Exploit Chains
 
-The following chains combine individual vulnerabilities into end-to-end attack scenarios demonstrating critical real-world impact. Each chain is independently reproducible.
+The following chain combines individual vulnerabilities into an end-to-end attack scenario demonstrating real-world impact.
 
 | Chain | Title | Severity | Components |
 |-------|-------|----------|------------|
-| CHAIN-1 | Credential Theft to Account Takeover | Critical | VULN-8 + VULN-7 |
-| CHAIN-2 | Browser Visit to Full RCE (dev mode) | Critical | VULN-9 + VULN-5 |
-| CHAIN-3 | Route Discovery to Auth Bypass to SSRF Pivot | Critical | VULN-11 + VULN-3 + VULN-1 |
+| CHAIN-1 | Credential Theft to Account Takeover | High | VULN-8 + VULN-7 |
 
 ---
 
 ### CHAIN-1: Credential Theft to Account Takeover
 
-**Severity:** Critical
+**Severity:** High (inherits deployment-dependent preconditions from both components: requires vulnerable middleware pattern AND direct internet-facing deployment without proxy overwriting `x-forwarded-host`)
 
 **Components:** VULN-8 (Middleware Rewrite SSRF with Credential Forwarding) + VULN-7 (Server Action CSRF Bypass via x-forwarded-host)
 
@@ -779,87 +590,52 @@ bash autofyn_audit/exploits/chain_credential_theft_account_takeover.sh
 
 **Real-World Impact:**
 
-No vulnerability in isolation is as severe as their combination. VULN-8 alone requires the attacker to steal credentials; VULN-7 alone requires the attacker to already have credentials. Together they form a complete account takeover chain: a single phishing link harvests a victim's session and immediately leverages it to perform privileged server-side mutations. Any authenticated user who clicks a crafted link is fully compromised. This meets the bar for Critical severity under CVSS 3.1 (network-exploitable, no privileges required, high impact on confidentiality/integrity).
+No vulnerability in isolation is as severe as their combination. VULN-8 alone requires the attacker to steal credentials; VULN-7 alone requires the attacker to already have credentials. Together they form a complete account takeover chain: a single phishing link harvests a victim's session and immediately leverages it to perform privileged server-side mutations. However, the chain inherits realistic preconditions from both components: the application must use middleware that passes user-controlled input to `NextResponse.rewrite()`, and must be directly internet-facing without a reverse proxy that overwrites `x-forwarded-host`. These preconditions reduce the severity from Critical to High.
 
 ---
 
-### CHAIN-2: Browser Visit to Full RCE (dev mode)
+## Appendix A: Informational Notes
 
-**Severity:** Critical
+### INFO-1: Server Actions Execute Without Origin Header (intentional defense-in-depth gap)
 
-**Components:** VULN-9 (DNS Rebinding Bypass of blockCrossSiteDEV) + VULN-5 (Unauthenticated V8 Inspector Open via Dev Endpoint)
+**Classification:** Informational — explicitly documented intentional behavior, not a vulnerability
 
-**Attack Narrative:**
+**Affected Code:**
+- `packages/next/src/server/app-render/action-handler.ts:646-651`
 
-A developer running `next dev` visits a malicious web page. The page performs DNS rebinding: after the developer's browser resolves the attacker's domain to the attacker's server and loads the page, the attacker's DNS TTL expires and the domain re-resolves to `127.0.0.1`. The malicious page then sends a same-origin request (from the browser's perspective) to `/__nextjs_attach-nodejs-inspector`. Because the browser sends no `Origin` header for the re-bound request, `blockCrossSiteDEV` short-circuits on the undefined origin and allows the request through, opening the V8 inspector. The attacker's page then connects to the inspector via CDP and executes arbitrary code in the developer's Node.js process: reading `/etc/passwd`, exfiltrating all environment variables and secrets, and writing persistent backdoor files.
+Server Actions allow requests without an `Origin` header, logging a warning but proceeding with execution. The source code contains an explicit comment documenting the design rationale:
 
-**Attack Flow:**
+> "This is a handcrafted request without an origin or a request from an unsafe browser. We'll let this through but log a warning. We can't guard against unsafe browsers and handcrafted requests can't contain user credentials that haven't been shared willingly."
 
-1. Verify that explicit `Origin: http://evil.com` to `/__nextjs_attach-nodejs-inspector` is blocked (403) — protection exists.
-2. DNS rebinding: send `GET /__nextjs_attach-nodejs-inspector` with `Host: evil.com:3000`, no `Origin` header — `blockCrossSiteDEV` sees `originLowerCase === undefined`, short-circuits to `false`, allows the request. Inspector opens (200) or confirms already open (500).
-3. Fetch `http://localhost:9230/json/list` with `Host: localhost:9230` — obtain WebSocket debugger URL.
-4. CDP `Runtime.evaluate`: `fs.readFileSync('/etc/passwd','utf-8')` — confirms `root:` in output.
-5. CDP `Runtime.evaluate`: `JSON.stringify(process.env)` — confirms `REACT_EDITOR` and all runtime secrets accessible.
-6. CDP `Runtime.evaluate`: `fs.readFileSync('/tmp/dev_secret.txt','utf-8')` — confirms `DEV_SECRET_KEY=sk-live-production-key-12345` exfiltrated.
-7. CDP `Runtime.evaluate` (combined expression): `(fs.writeFileSync('/tmp/chain2_backdoor.txt','BACKDOOR_INSTALLED_BY_CHAIN2'), fs.readFileSync('/tmp/chain2_backdoor.txt','utf-8'))` — comma operator returns the string result, confirming persistent filesystem write.
+This is standard CSRF protection design — browser-originated cross-site requests always include `Origin`, and the check handles that case. Blocking missing-Origin requests would break legitimate non-browser API clients (curl, server-to-server calls, older browsers, privacy extensions). Django, Rails, and Laravel all have similar "no origin = allow" patterns.
 
-**Reproduction:**
-
-```bash
-bash autofyn_audit/exploits/chain_dns_rebinding_to_rce.sh
-```
-
-**Evidence:**
-
-- Step 1 confirms blockCrossSiteDEV is active.
-- Step 2 confirms bypass: non-403 response with spoofed Host and no Origin.
-- Steps 4-7 confirm unrestricted code execution: filesystem read, env var exfiltration, secret exfiltration, backdoor write.
-
-**Real-World Impact:**
-
-A developer running the Next.js dev server on their laptop is fully compromised by a single malicious web page visit. The attacker gains the ability to read all files accessible to the Node.js process (including `.env`, SSH keys, cloud credentials), exfiltrate all environment variables (including API keys and database passwords), and write persistent backdoors. This does not require any user interaction beyond visiting a page. While dev-mode, this is a realistic attack against developer workstations which commonly hold production credentials.
+**Residual risk:** In environments where a compromised proxy strips `Origin` headers before they reach Next.js, the CSRF check is bypassed — but the proxy compromise is already a severe condition.
 
 ---
 
-### CHAIN-3: Route Discovery to Auth Bypass to SSRF Pivot
+## Appendix B: Removed Findings (Verification Notes)
 
-**Severity:** Critical
+The following findings were present in the initial draft but removed during adversarial review. They are documented here for transparency.
 
-**Components:** VULN-11 (Route Oracle and SSR Skip via x-middleware-prefetch) + VULN-3 (Server Actions Execute Without Origin Header) + VULN-1 (SSRF via Image Optimizer Redirect)
+### VULN-2: Auth Bypass via Internal Header Injection (NEXT_PRIVATE_TEST_HEADERS) — REMOVED
 
-**Attack Narrative:**
+**Reason for removal:** `NEXT_PRIVATE_TEST_HEADERS` is an explicitly labeled test-only env var (`PRIVATE` in the name signals internal use). Setting it in production is a user configuration error, not a framework vulnerability. The variable disables `filterInternalHeaders()`, which is its intended purpose for test environments. Filing this as a security finding is equivalent to reporting that `NODE_ENV=development` in production exposes debug endpoints. No maintainer would accept this.
 
-An unauthenticated attacker begins by mapping the application's route structure using the `x-middleware-prefetch` route oracle (VULN-11): dynamic (non-SSG) routes return `x-matched-path` and body `{}`, SSG routes return HTTP 200 with normal content, while nonexistent routes return real 404 pages — a clear three-way signal that lets the attacker enumerate which routes exist and their rendering mode. Unlike CHAIN-1 and CHAIN-2 where each vulnerability enables the next, the components of CHAIN-3 are independently exploitable. Their combination demonstrates the breadth of unauthenticated attack surface rather than a single causal attack path. Having confirmed `/protected` is a real dynamic route, the attacker also observes that its server-side auth check is bypassed entirely (SSR skipped). The attacker then invokes a server action without any `Origin` header (VULN-3), which Next.js allows by design — enabling privileged mutations without CSRF protection. Finally, the attacker uses the image optimizer to pivot to an internal network host that is not in `remotePatterns` (VULN-1), by routing through an allowed redirect server and having the optimizer follow the redirect to the internal target.
+### VULN-5: Unauthenticated V8 Inspector Open via Dev Endpoint — REMOVED
 
-**Attack Flow:**
+**Reason for removal:** The `/__nextjs_attach-nodejs-inspector` endpoint calls `inspector.open()`, which is the standard Node.js debugging API. The default binding is `127.0.0.1:9229` (localhost only) — this is Node.js's security boundary, not Next.js's responsibility. This is dev-mode-only tooling that exists to support the Next.js DevTools experience. Every dev server in the ecosystem (webpack-dev-server, Vite, etc.) provides equivalent debug capabilities. The PoC required `--inspect=0.0.0.0:9229` to simulate network accessibility, which is a non-default user configuration.
 
-1. Probe `/protected`, `/`, and `/nonexistent-abc123-probe` with `x-middleware-prefetch: 1`. Dynamic routes return `x-matched-path` + `{}`, SSG routes return HTTP 200, nonexistent routes return 404 — confirming the oracle discriminates.
-2. Confirm SSR auth bypass: normal GET to `/protected` returns `Access Denied`; GET with `x-middleware-prefetch: 1` returns `{}` — auth check completely skipped.
-3. Extract server action ID; POST to `/` with `Next-Action`, `Cookie: session=victim_session`, no `Origin` header, body `[]`. HTTP 200 without `Invalid Server Actions request` — action executes without CSRF check.
-4. Request `/_next/image?url=http://audit-redirect-server:8080/redirect-to-secret&w=3840&q=75`. Image optimizer follows the 302 to `audit-secret-server:9090`. Count of `SECRET_ACCESS` log entries increases — internal service reached.
-5. Negative control: direct request to `audit-secret-server:9090` via image optimizer returns 400 (remotePatterns blocks it), confirming the redirect was required for the pivot.
+### CHAIN-2: Browser Visit to Full RCE (dev mode) — REMOVED
 
-**Reproduction:**
+**Reason for removal:** This chain combined VULN-9 (DNS rebinding, retained as Medium) with VULN-5 (inspector, removed). With VULN-5 removed, the chain's RCE component is gone. VULN-9 alone enables access to dev endpoints, but the practical impact is limited to reading source maps and file existence oracles — capabilities already covered by VULN-4 and VULN-6. The DNS rebinding bypass is genuine but its impact is adequately represented by the standalone VULN-9 finding.
 
-```bash
-bash autofyn_audit/exploits/chain_recon_to_ssrf_pivot.sh
-```
+### CHAIN-3: Route Discovery to Auth Bypass to SSRF Pivot — REMOVED
 
-**Evidence:**
-
-- Step 1 confirms route oracle: `/protected` and `/` identified as real routes; `/nonexistent-abc123-probe` distinguished as nonexistent.
-- Step 2 confirms SSR auth bypass on the discovered protected route.
-- Step 3 confirms server action executes without CSRF protection.
-- Step 4 confirms SSRF pivot: `SECRET_ACCESS` log count increases after chain's request.
-- Step 5 confirms remotePatterns is enforced for direct access — redirect was necessary.
-
-**Real-World Impact:**
-
-The attacker achieves three critical capabilities, each independently exploitable without authentication: mapping of the entire application route structure (including hidden/protected endpoints), bypassing server-side authentication on those routes, and reaching internal network services not exposed to the public internet. The SSRF pivot in particular can be used to access internal APIs, metadata services (e.g., AWS IMDS at `169.254.169.254`), or internal databases — turning a web application vulnerability into a cloud infrastructure compromise.
+**Reason for removal:** The report honestly stated that "the components of CHAIN-3 are independently exploitable" and that their combination "demonstrates the breadth of unauthenticated attack surface rather than a single causal attack path." This is not a chain — it is three independent findings (VULN-11, VULN-3, VULN-1) listed together. VULN-3 was further demoted to informational (documented intentional behavior). Each remaining component (VULN-1 and VULN-11) is adequately covered as a standalone finding.
 
 ---
 
-## Appendix: Test Environment
+## Appendix C: Test Environment
 
 ```
 audit-net (Docker bridge network)
@@ -874,9 +650,11 @@ audit-net (Docker bridge network)
   +-- audit-credential-capture (9091:9091) — logs captured Cookie+Authorization headers
 ```
 
-To reproduce all 14/14 findings (11 individual vulnerabilities + 3 exploit chains):
+To reproduce all findings (8 vulnerabilities + 1 exploit chain):
 ```bash
 bash autofyn_audit/setup.sh
 bash autofyn_audit/run_all_exploits.sh
 bash autofyn_audit/teardown.sh
 ```
+
+Note: The exploit suite still contains scripts for removed findings (VULN-2, VULN-5) and chains (CHAIN-2, CHAIN-3) for archival purposes. They all pass live but were excluded from the report based on adversarial threat-model review.
