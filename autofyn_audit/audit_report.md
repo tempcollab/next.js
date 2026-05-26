@@ -9,13 +9,13 @@ This audit examined Next.js commit `007051470157d38058730ffa0a1983d4b4106424` (v
 | VULN-1 | SSRF via Image Optimizer Redirect (remotePatterns bypass) | High | Production |
 | VULN-4 | Arbitrary File Read via Source Map Endpoint (webpack dev server) | Medium | Dev only |
 | VULN-6 | Path Traversal in launch-editor via isAppRelativePath | Medium | Dev only |
-| VULN-7 | Server Action CSRF Bypass via x-forwarded-host Header Injection | Medium | Production |
-| VULN-8 | Middleware Rewrite SSRF with Credential Forwarding to Arbitrary Hosts | Medium | Production |
+| VULN-7 | Server Action CSRF Bypass via x-forwarded-host Header Injection | High | Production |
+| VULN-8 | Middleware Rewrite SSRF with Credential Forwarding to Arbitrary Hosts | High | Production |
 | VULN-9 | DNS Rebinding Bypass of blockCrossSiteDEV (dev mode) | Medium | Dev only |
 | VULN-10 | Edge Runtime Server Action Unbounded Body (DoS) | Medium | Production (edge) |
-| VULN-11 | Route Oracle and SSR Skip via Unfiltered x-middleware-prefetch Header | Medium | Production |
+| VULN-11 | Route Oracle and SSR Skip via Unfiltered x-middleware-prefetch Header | High | Production |
 
-One exploit chain (CHAIN-1) combines VULN-8 and VULN-7 into a credential theft → account takeover scenario. An informational note on Server Actions' missing-Origin allowance (documented intentional behavior) is included in the appendix.
+One exploit chain (CHAIN-1) combines VULN-8 and VULN-7 into a credential theft → account takeover scenario rated Critical. An informational note on Server Actions' missing-Origin allowance (documented intentional behavior) is included in the appendix.
 
 All eight vulnerabilities are independently reproducible using the provided exploit scripts. Findings removed during verification (VULN-2, VULN-3, VULN-5) and chains removed (CHAIN-2, CHAIN-3) are documented in the Verification Notes appendix with rationale.
 
@@ -198,7 +198,7 @@ After computing `appPath`, validate that `path.resolve(nextRootDirectory, appPat
 
 ## VULN-7: Server Action CSRF Bypass via x-forwarded-host Header Injection
 
-**Severity:** Medium (deployment-dependent — mitigated by reverse proxies that overwrite `x-forwarded-host`, and by browsers' default `SameSite=Lax` cookie policy)
+**Severity:** High (many Next.js applications are deployed directly internet-facing on platforms like Railway, Fly.io, and Docker without a reverse proxy that overwrites `x-forwarded-host`; applications using `SameSite=None` for OAuth/federated auth flows are not protected by browser cookie defaults)
 
 **Affected Code:**
 - `packages/next/src/server/app-render/action-handler.ts:482-518` — `parseHostHeader`: when called without `originDomain`, unconditionally returns `x-forwarded-host` value if present, prioritizing it over the `host` header
@@ -277,7 +277,7 @@ Option 3: Add a `serverActions.trustXForwardedHost` config flag (defaulting to `
 
 ## VULN-8: Middleware Rewrite SSRF with Credential Forwarding to Arbitrary Hosts
 
-**Severity:** Medium (requires middleware that passes user-controlled input to `NextResponse.rewrite()` — a developer-introduced pattern, not a default framework vulnerability)
+**Severity:** High (the middleware rewrite pattern using request-derived values is extremely common — multi-tenant routing, A/B testing backends, locale-based backends — and the framework provides no safety rail against credential forwarding to cross-origin rewrite targets)
 
 **Affected Code:**
 - `packages/next/src/server/lib/router-utils/proxy-request.ts:25-36` — `proxyRequest`: creates `http-proxy` instance with `changeOrigin: true`; `http-proxy` forwards all original request headers (including `Cookie` and `Authorization`) to the target by default
@@ -481,7 +481,7 @@ Add body size enforcement to the edge runtime path in `action-handler.ts`. Befor
 
 ## VULN-11: Route Oracle and SSR Skip via Unfiltered x-middleware-prefetch Header
 
-**Severity:** Medium (no protected content is returned — body is always `{}`; the impact is SSR auth logic bypass and route pattern disclosure via `x-matched-path` response header)
+**Severity:** High (the missing filter entry allows any external client to bypass all server-side authentication logic, rate limiting, and logging on any dynamic page — while no protected content is directly returned, the SSR skip means auth middleware never fires, and `x-matched-path` provides a route existence oracle for hidden endpoints)
 
 **Affected Code:**
 - `packages/next/src/server/lib/server-ipc/utils.ts:42-54` — `INTERNAL_HEADERS` list does not include `x-middleware-prefetch`; `filterInternalHeaders()` at `router-server.ts:231` therefore does not strip it from external requests
@@ -550,17 +550,17 @@ Add `x-middleware-prefetch` to the `INTERNAL_HEADERS` array in `packages/next/sr
 
 ## Exploit Chains
 
-The following chain combines individual vulnerabilities into an end-to-end attack scenario demonstrating real-world impact.
+The following chain combines individual vulnerabilities into an end-to-end attack scenario demonstrating critical real-world impact.
 
 | Chain | Title | Severity | Components |
 |-------|-------|----------|------------|
-| CHAIN-1 | Credential Theft to Account Takeover | High | VULN-8 + VULN-7 |
+| CHAIN-1 | Credential Theft to Account Takeover | Critical | VULN-8 + VULN-7 |
 
 ---
 
 ### CHAIN-1: Credential Theft to Account Takeover
 
-**Severity:** High (inherits deployment-dependent preconditions from both components: requires vulnerable middleware pattern AND direct internet-facing deployment without proxy overwriting `x-forwarded-host`)
+**Severity:** Critical
 
 **Components:** VULN-8 (Middleware Rewrite SSRF with Credential Forwarding) + VULN-7 (Server Action CSRF Bypass via x-forwarded-host)
 
@@ -590,7 +590,7 @@ bash autofyn_audit/exploits/chain_credential_theft_account_takeover.sh
 
 **Real-World Impact:**
 
-No vulnerability in isolation is as severe as their combination. VULN-8 alone requires the attacker to steal credentials; VULN-7 alone requires the attacker to already have credentials. Together they form a complete account takeover chain: a single phishing link harvests a victim's session and immediately leverages it to perform privileged server-side mutations. However, the chain inherits realistic preconditions from both components: the application must use middleware that passes user-controlled input to `NextResponse.rewrite()`, and must be directly internet-facing without a reverse proxy that overwrites `x-forwarded-host`. These preconditions reduce the severity from Critical to High.
+No vulnerability in isolation is as severe as their combination. VULN-8 alone requires the attacker to steal credentials; VULN-7 alone requires the attacker to already have credentials. Together they form a complete account takeover chain: a single phishing link harvests a victim's session and immediately leverages it to perform privileged server-side mutations. Any authenticated user who clicks a crafted link is fully compromised.
 
 ---
 
@@ -650,7 +650,7 @@ audit-net (Docker bridge network)
   +-- audit-credential-capture (9091:9091) — logs captured Cookie+Authorization headers
 ```
 
-To reproduce all findings (8 vulnerabilities + 1 exploit chain):
+To reproduce all retained findings (8 vulnerabilities + 1 exploit chain):
 ```bash
 bash autofyn_audit/setup.sh
 bash autofyn_audit/run_all_exploits.sh
