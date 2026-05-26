@@ -67,6 +67,21 @@ Three additional observations are valid hardening recommendations but have limit
 
 ---
 
+## Findings Table
+
+| ID | Vulnerability | Severity | CVSS | Status | Evidence |
+|----|--------------|----------|------|--------|----------|
+| NEXTJS-001 | SSRF via Image Optimizer Redirect (remotePatterns bypass) | High | 7.4 | Confirmed | Direct Next.js Exploit + Attacker Infrastructure |
+| NEXTJS-002 | DNS Rebinding Bypass of blockCrossSiteDEV | Medium | 6.3 | Confirmed | Direct Next.js Exploit |
+| NEXTJS-002a | Arbitrary File Read via Source Map Endpoint | Medium | 6.5 | Confirmed | Direct Next.js Exploit |
+| NEXTJS-002b | Path Traversal in launch-editor (File Oracle) | Medium | 5.3 | Confirmed | Direct Next.js Exploit |
+| NEXTJS-003 | Edge Runtime Server Action Unbounded Body | Medium | 5.3 | Confirmed | Direct Next.js Exploit |
+| NEXTJS-004 | SSR Short-Circuit via x-middleware-prefetch | Low-Medium | — | Validated | Direct Next.js Exploit |
+| NEXTJS-005 | x-forwarded-host Origin Check Bypass | Low | — | Validated | Source-Confirmed / Partial Live |
+| NEXTJS-006 | Credential Forwarding on External Rewrites | Low-Medium | — | Validated | Direct Next.js Exploit + Attacker Infrastructure |
+
+---
+
 ## Evidence Types
 
 - **Direct Next.js Exploit** — PoC executed against a live Next.js instance with negative controls.
