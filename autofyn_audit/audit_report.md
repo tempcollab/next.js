@@ -12,7 +12,7 @@
 
 **Date:** 2026-05-26
 
-**Status:** 3 Issues Submitted (1 High, 2 Medium), Hardening Notes Documented
+**Status:** 3 Advisory Submissions Covering 5 Confirmed Findings (1 High, 4 Medium)
 
 ---
 
@@ -73,7 +73,7 @@ Three additional observations are valid hardening recommendations but have limit
 |----|--------------|----------|------|--------|----------|
 | NEXTJS-001 | SSRF via Image Optimizer Redirect (remotePatterns bypass) | High | 7.4 | Confirmed | Direct Next.js Exploit + Attacker Infrastructure |
 | NEXTJS-002 | DNS Rebinding Bypass of blockCrossSiteDEV | Medium | 6.3 | Confirmed | Direct Next.js Exploit |
-| NEXTJS-002a | Arbitrary File Read via Source Map Endpoint | Medium | 6.5 | Confirmed | Direct Next.js Exploit |
+| NEXTJS-002a | Source Map Disclosure + File Oracle via Source Map Endpoint | Medium | 6.5 | Confirmed | Direct Next.js Exploit |
 | NEXTJS-002b | Path Traversal in launch-editor (File Oracle) | Medium | 5.3 | Confirmed | Direct Next.js Exploit |
 | NEXTJS-003 | Edge Runtime Server Action Unbounded Body | Medium | 5.3 | Confirmed | Direct Next.js Exploit |
 
@@ -172,7 +172,7 @@ curl -s -o /dev/null -w '%{http_code}' -H "Host: evil.com:3000" \
 
 **Description:**
 
-The `/__nextjs_source-map` endpoint accepts arbitrary filesystem paths via the `filename` parameter. `getSourceMapFromFile` reads the file, then follows any `//# sourceMappingURL=` comment to read a second file. No path validation or project-root scoping exists. Exploitable by any process with network access to the dev server (independently of VULN-9).
+The `/__nextjs_source-map` endpoint accepts arbitrary filesystem paths via the `filename` parameter with no validation. `getSourceMapFromFile` reads the file and searches for a `//# sourceMappingURL=` comment. If found, it reads and returns the referenced source map (parsed as JSON with `sourcesContent`). If no `sourceMappingURL` is present, the endpoint returns 204 (confirming file existence) without disclosing contents. If the file doesn't exist, it returns 500 with error details including the absolute path. This creates: (1) a file existence oracle (204 vs 500), (2) source map content disclosure for project files that reference source maps, and (3) path leakage in error responses. Exploitable by any process with network access to the dev server (independently of VULN-9).
 
 **Proof of Concept:**
 

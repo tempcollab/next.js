@@ -4,7 +4,7 @@
 **CWE:** CWE-350: Reliance on Reverse DNS Resolution for a Security-Critical Action
 **Ecosystem:** npm
 **Package Name:** next
-**Affected Versions:** <= 16.3.0-canary.29
+**Affected Versions:** Confirmed on 16.3.0-canary.29 (commit `007051470157d38058730ffa0a1983d4b4106424`); earlier versions not exhaustively tested
 **Patched Versions:** None
 
 > Discovered by [AutoFyn](https://github.com/SignalPilot-Labs/AutoFyn). Full audit: [audit_report.md](https://github.com/tempcollab/next.js/blob/canary/autofyn_audit/audit_report.md)
@@ -14,7 +14,7 @@
 The `blockCrossSiteDEV` function in the Next.js dev server allows all requests with no `Origin` header and never validates the `Host` header. Under DNS rebinding, a malicious webpage can reach all `/__nextjs*` dev endpoints by exploiting this gap in Firefox and Safari. Chrome's Private Network Access (PNA) blocks this attack vector.
 
 The exposed endpoints include:
-- `/__nextjs_source-map` — arbitrary file read via `filename` parameter (no path validation)
+- `/__nextjs_source-map` — file existence oracle (204 vs 500) and source-map content disclosure when the target file contains or references a readable source map with `sourcesContent`; error responses leak absolute paths
 - `/__nextjs_launch-editor` — file existence oracle via path traversal (204/404 differential)
 
 ### Details
@@ -29,9 +29,9 @@ return (
 )
 ```
 
-When `originLowerCase === undefined` (no Origin header), the expression short-circuits to `false` — the request is allowed. DNS-rebound requests are same-origin from the browser's perspective, so no Origin header is sent. The `Host` header is never checked.
+When `originLowerCase === undefined` (no Origin header), the expression short-circuits to `false` — the request is allowed. The `Host` header is never checked. This is DNS rebinding-compatible server behavior: under DNS rebinding, the browser sends same-origin requests (no Origin header) with the attacker's Host value. The curl PoC below demonstrates the server-side bypass condition; a full browser DNS rebinding PoC requires external DNS infrastructure with short TTL.
 
-**Source map file read (independently exploitable):** `/__nextjs_source-map` accepts a `filename` parameter with no validation. `getSourceMapFromFile` reads the file at the given path, then follows any `//# sourceMappingURL=` comment to read a second file. This allows reading arbitrary filesystem contents accessible to the Node process.
+**Source map endpoint (independently exploitable):** `/__nextjs_source-map` accepts a `filename` parameter with no path validation. `getSourceMapFromFile` reads the file, then searches for a `//# sourceMappingURL=` comment. If found, it reads and returns the referenced source map (parsed as JSON with `sourcesContent`). If no `sourceMappingURL` is present, the endpoint returns 204 (file exists) without disclosing contents. If the file does not exist, the endpoint returns 500 with error details including the absolute path. This creates a file existence oracle (204 vs 500), source map disclosure for files that already reference source maps, and path leakage in error responses.
 
 **Launch-editor path traversal (independently exploitable):** `/__nextjs_launch-editor` with `isAppRelativePath=1` allows `../` sequences in `path.join`, resolving to paths outside the project root. `fsp.access(filePath, F_OK)` returns 204/404 based on file existence.
 
@@ -55,4 +55,4 @@ curl -s -o /dev/null -w '%{http_code}' \
 
 ### Impact
 
-A developer running `next dev` who visits a malicious webpage in Firefox or Safari exposes their local filesystem to the attacker's page. The attacker can read arbitrary files (via source-map chaining) and enumerate filesystem paths (via launch-editor oracle). Chrome users are protected by Private Network Access. The endpoints are also directly exploitable by any process with network access to the dev server port (CI environments, cloud IDEs, adjacent network devices).
+The dev server's `blockCrossSiteDEV` does not validate the `Host` header, making it compatible with DNS rebinding attacks in Firefox and Safari (Chrome blocks via Private Network Access). An attacker can enumerate file existence on the developer's machine (via 204/500 differential on source-map endpoint and 204/404 on launch-editor), read source map contents for project files that reference source maps, and leak absolute paths from error responses. The endpoints are also directly exploitable by any process with network access to the dev server port (CI environments, cloud IDEs, adjacent network devices).
