@@ -12,7 +12,7 @@
 
 **Date:** 2026-05-26
 
-**Status:** 3 Report-Worthy Issues Confirmed, 3 Hardening Observations, Archived Findings Excluded
+**Status:** 3 Issues Submitted (1 High, 2 Medium), Hardening Notes Documented
 
 ---
 
@@ -76,9 +76,9 @@ Three additional observations are valid hardening recommendations but have limit
 | NEXTJS-002a | Arbitrary File Read via Source Map Endpoint | Medium | 6.5 | Confirmed | Direct Next.js Exploit |
 | NEXTJS-002b | Path Traversal in launch-editor (File Oracle) | Medium | 5.3 | Confirmed | Direct Next.js Exploit |
 | NEXTJS-003 | Edge Runtime Server Action Unbounded Body | Medium | 5.3 | Confirmed | Direct Next.js Exploit |
-| NEXTJS-004 | SSR Short-Circuit via x-middleware-prefetch | Low-Medium | — | Validated | Direct Next.js Exploit |
-| NEXTJS-005 | x-forwarded-host Origin Check Bypass | Low | — | Validated | Source-Confirmed / Partial Live |
-| NEXTJS-006 | Credential Forwarding on External Rewrites | Low-Medium | — | Validated | Direct Next.js Exploit + Attacker Infrastructure |
+
+
+Additional hardening observations (VULN-7, VULN-8, VULN-11) are documented below but not submitted as advisories.
 
 ---
 
@@ -360,12 +360,9 @@ autofyn_audit/
 ├── setup.sh / teardown.sh / run_all_exploits.sh
 ├── Dockerfile.runner
 ├── docs/
-│   ├── NEXTJS-001.md    # Image optimizer SSRF via redirect (VULN-1)
-│   ├── NEXTJS-002.md    # Dev-mode DNS rebinding + file read (VULN-9/4/6)
-│   ├── NEXTJS-003.md    # Edge runtime unbounded body (VULN-10)
-│   ├── NEXTJS-004.md    # x-middleware-prefetch SSR skip + route oracle (VULN-11)
-│   ├── NEXTJS-005.md    # x-forwarded-host header trust (VULN-7)
-│   └── NEXTJS-006.md    # Credential forwarding on external rewrites (VULN-8)
+│   ├── NEXTJS-001.md    # Advisory: Image optimizer SSRF via redirect (VULN-1)
+│   ├── NEXTJS-002.md    # Advisory: Dev-mode DNS rebinding + file read (VULN-9/4/6)
+│   └── NEXTJS-003.md    # Advisory: Edge runtime unbounded body (VULN-10)
 ├── exploits/
 │   ├── exploit_ssrf_redirect.sh
 │   ├── exploit_dev_file_read.sh
