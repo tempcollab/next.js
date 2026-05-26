@@ -95,19 +95,20 @@ Additional hardening observations (VULN-7, VULN-8, VULN-11) are documented below
 ### VULN-1: SSRF via Image Optimizer Redirect (remotePatterns bypass)
 
 **Severity:** High (CVSS 7.4)
-**CVSS Vector:** `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:L/I:N/A:N`
+**CVSS Vector:** `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:N/I:L/A:N`
 **CWE:** CWE-918: Server-Side Request Forgery (SSRF)
 **Evidence:** Direct Next.js Exploit + Attacker Infrastructure
 
 **Affected Code:**
 - `packages/next/src/server/image-optimizer.ts:454` — `hasRemoteMatch` on initial URL only
 - `packages/next/src/server/image-optimizer.ts:909-928` — recursive redirect following without `remotePatterns` re-validation
+- `packages/next/src/server/image-optimizer.ts:723` — `writeToCacheDir` caches the fetched result to disk
 
 **Description:**
 
 The image optimizer validates the initial requested URL against `remotePatterns` via `hasRemoteMatch` but follows HTTP redirects recursively without re-checking the redirect target against the allowlist. `isPrivateIp()` IS enforced on redirect targets (blocking RFC 1918, link-local, and loopback ranges), but redirects to arbitrary public/routable hosts bypass `remotePatterns` entirely.
 
-An attacker who controls any server listed in `remotePatterns` (or can inject a redirect on such a server) can cause the image optimizer to fetch from any public host not in the allowlist.
+An attacker who can place a redirect on any host in `remotePatterns` (open redirect, compromised CDN path, or controlled subdomain on a wildcard pattern) can serve attacker-controlled image content through the victim's `/_next/image` endpoint. The optimized result is cached to disk via `writeToCacheDir` and served to all subsequent visitors — enabling image cache poisoning from the application's own domain. Realistic scenarios include phishing images, brand defacement, and fake login form screenshots served from a trusted origin.
 
 **Proof of Concept:**
 
