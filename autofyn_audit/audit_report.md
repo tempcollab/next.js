@@ -15,8 +15,8 @@ This audit examined Next.js commit `007051470157d38058730ffa0a1983d4b4106424` (v
 | VULN-7 | Server Action CSRF Bypass via x-forwarded-host Header Injection | High |
 | VULN-8 | Middleware Rewrite SSRF with Credential Forwarding to Arbitrary Hosts | High |
 | VULN-9 | DNS Rebinding Bypass of blockCrossSiteDEV (dev mode) | High |
-| VULN-10 | Edge Runtime Server Action Unbounded Body (DoS) | High |
-| VULN-11 | SSR Bypass via x-middleware-prefetch Header Injection | High |
+| VULN-10 | Edge Runtime Server Action Unbounded Body (DoS) | Medium |
+| VULN-11 | Route Oracle and SSR Skip via Unfiltered x-middleware-prefetch Header | High |
 
 All eleven vulnerabilities are independently reproducible using the provided exploit scripts. Three end-to-end exploit chains (CHAIN-1 through CHAIN-3) combine individual vulnerabilities into complete attack scenarios — credential theft to account takeover, browser visit to full RCE, and route discovery to SSRF pivot — demonstrating critical real-world impact that cannot be dismissed as hypothetical.
 
@@ -52,6 +52,8 @@ An attacker who controls any server in `remotePatterns` (or can intercept traffi
 A production deployment allows `remotePatterns` for `images.example.com` (legitimate CDN). An attacker sets up a redirect at `https://images.example.com/evil-redirect` that points to `http://internal-metadata-server/latest/meta-data/`. The image optimizer fetches the redirect target and returns its content as an "image," exfiltrating internal service data.
 
 In the audit environment: `remotePatterns` allows `audit-redirect-server:8080`. A request to `/_next/image?url=http://audit-redirect-server:8080/redirect-to-secret&w=640&q=75` causes the optimizer to follow a redirect to `audit-secret-server:9090`, which is not in `remotePatterns`.
+
+**Configuration note:** The Docker PoC sets `dangerouslyAllowLocalIP: true` in `next.config.js` because the test environment uses private Docker network IPs. Without this flag, redirects to private IP ranges (10.x, 172.16-31.x, 169.254.x, 127.x) are blocked by `isPrivateIp()` in `fetchExternalImage`. The core vulnerability — missing `remotePatterns` re-validation on redirect targets — works against any redirect target on a public IP without `dangerouslyAllowLocalIP`. For example, a redirect from an allowed CDN host to an attacker-controlled public server bypasses `remotePatterns` regardless of this setting.
 
 **Reproduction Steps:**
 
@@ -516,6 +518,8 @@ Option 2: Add a `rewrites.allowedExternalHosts` config option (analogous to `ima
 
 Option 3: Document the credential-forwarding behavior prominently in the `NextResponse.rewrite()` documentation, so developers using user-controlled values as rewrite destinations understand the risk. This is a mitigation, not a fix.
 
+**PoC note:** The audit test app uses purpose-built middleware that passes a query parameter directly to `NextResponse.rewrite()`. In production, middleware that uses any request-derived value (path segments, cookies, headers) as a rewrite destination is susceptible to the same credential-forwarding issue. Common patterns include multi-tenant routing, A/B testing backends, and locale-based backend selection.
+
 ---
 
 ## VULN-9: DNS Rebinding Bypass of blockCrossSiteDEV (dev mode)
@@ -598,7 +602,7 @@ Validate the `Host` header in `blockCrossSiteDEV`. If the `Host` header does not
 
 ## VULN-10: Edge Runtime Server Action Unbounded Body (DoS)
 
-**Severity:** High
+**Severity:** Medium
 
 **Affected Code:**
 - `packages/next/src/server/app-render/action-handler.ts:759` — explicit `// TODO: add body limit` comment; no size check anywhere in the edge block (lines 749-869)
@@ -610,11 +614,11 @@ Validate the `Host` header in `blockCrossSiteDEV`. If the `Host` header does not
 
 The action handler has two paths: Node runtime (lines 875+) and edge runtime (lines 749-869). The Node path wraps the request body in `sizeLimitTransform`, which counts bytes and throws an `ApiError(413)` when the body exceeds the configured limit (default 1MB). This error is caught by the RSC error boundary (resulting in HTTP 500 to the client), but critically the body read is aborted before the full payload is buffered — the server is protected from memory exhaustion. The edge runtime path has an explicit `// TODO: add body limit` comment but no enforcement. All body reads in the edge path — both multipart (`formData()`) and non-multipart (reader loop) — are unbounded.
 
-An attacker can exhaust server memory by sending arbitrarily large request bodies to any edge-runtime server action endpoint.
+An attacker can send bodies exceeding the intended 1MB limit to any edge-runtime server action endpoint. While this is a defense-in-depth gap (the Node runtime enforces the limit but edge does not), practical DoS impact depends on the deployment platform's own body size limits and the server's available memory.
 
 **Attack Scenario:**
 
-A Next.js application uses `export const runtime = 'edge'` on a page or route handler (e.g., for low-latency response or Vercel Edge Network deployment) that also processes server actions. An attacker sends a series of multi-megabyte POST requests to the server action endpoint. The edge handler buffers the entire body before processing. With no limit, the attacker can send gigabyte-scale bodies, exhausting the process's memory and causing a denial of service.
+A Next.js application uses `export const runtime = 'edge'` on a page or route handler (e.g., for low-latency response or Vercel Edge Network deployment) that also processes server actions. An attacker sends a series of multi-megabyte POST requests to the server action endpoint. The edge handler buffers the entire body before processing. With no limit, the attacker can send bodies exceeding the intended 1MB limit. The practical ceiling depends on the deployment platform's ingress limits (e.g., Vercel Edge Functions enforce their own body limits), but self-hosted deployments have no framework-level protection on this code path.
 
 **Production impact:** This is exploitable with `next start` (production mode) against any page with `export const runtime = 'edge'` that accepts form submissions or server actions. No authentication required.
 
@@ -662,7 +666,7 @@ Add body size enforcement to the edge runtime path in `action-handler.ts`. Befor
 
 ---
 
-## VULN-11: SSR Bypass via x-middleware-prefetch Header Injection
+## VULN-11: Route Oracle and SSR Skip via Unfiltered x-middleware-prefetch Header
 
 **Severity:** High
 
@@ -689,7 +693,7 @@ if (
 }
 ```
 
-All server-side rendering is skipped: server components, `getServerSideProps`, any auth checks, any SSR side effects (logging, rate limiting, analytics). The `x-matched-path` response header additionally leaks the matched route pattern.
+All server-side rendering is skipped: server components, `getServerSideProps`, any auth checks, any SSR side effects (logging, rate limiting, analytics). While no protected content is returned (the body is always `{}`), the SSR skip means authentication logic, rate limiting, and server-side logging never execute for the request. The `x-matched-path` response header additionally leaks the matched route pattern.
 
 **Attack Scenario:**
 
@@ -821,11 +825,11 @@ A developer running the Next.js dev server on their laptop is fully compromised 
 
 **Severity:** Critical
 
-**Components:** VULN-11 (SSR Bypass via x-middleware-prefetch) + VULN-3 (Server Actions Execute Without Origin Header) + VULN-1 (SSRF via Image Optimizer Redirect)
+**Components:** VULN-11 (Route Oracle and SSR Skip via x-middleware-prefetch) + VULN-3 (Server Actions Execute Without Origin Header) + VULN-1 (SSRF via Image Optimizer Redirect)
 
 **Attack Narrative:**
 
-An unauthenticated attacker begins by mapping the application's route structure using the `x-middleware-prefetch` route oracle (VULN-11): dynamic (non-SSG) routes return `x-matched-path` and body `{}`, SSG routes return HTTP 200 with normal content, while nonexistent routes return real 404 pages — a clear three-way signal that lets the attacker enumerate which routes exist and their rendering mode. Having confirmed `/protected` is a real dynamic route, the attacker also observes that its server-side auth check is bypassed entirely (SSR skipped). The attacker then invokes a server action without any `Origin` header (VULN-3), which Next.js allows by design — enabling privileged mutations without CSRF protection. Finally, the attacker uses the image optimizer to pivot to an internal network host that is not in `remotePatterns` (VULN-1), by routing through an allowed redirect server and having the optimizer follow the redirect to the internal target.
+An unauthenticated attacker begins by mapping the application's route structure using the `x-middleware-prefetch` route oracle (VULN-11): dynamic (non-SSG) routes return `x-matched-path` and body `{}`, SSG routes return HTTP 200 with normal content, while nonexistent routes return real 404 pages — a clear three-way signal that lets the attacker enumerate which routes exist and their rendering mode. Unlike CHAIN-1 and CHAIN-2 where each vulnerability enables the next, the components of CHAIN-3 are independently exploitable. Their combination demonstrates the breadth of unauthenticated attack surface rather than a single causal attack path. Having confirmed `/protected` is a real dynamic route, the attacker also observes that its server-side auth check is bypassed entirely (SSR skipped). The attacker then invokes a server action without any `Origin` header (VULN-3), which Next.js allows by design — enabling privileged mutations without CSRF protection. Finally, the attacker uses the image optimizer to pivot to an internal network host that is not in `remotePatterns` (VULN-1), by routing through an allowed redirect server and having the optimizer follow the redirect to the internal target.
 
 **Attack Flow:**
 
@@ -851,7 +855,7 @@ bash autofyn_audit/exploits/chain_recon_to_ssrf_pivot.sh
 
 **Real-World Impact:**
 
-The attacker achieves three critical capabilities in sequence, all without authentication: mapping of the entire application route structure (including hidden/protected endpoints), bypassing server-side authentication on those routes, and reaching internal network services not exposed to the public internet. The SSRF pivot in particular can be used to access internal APIs, metadata services (e.g., AWS IMDS at `169.254.169.254`), or internal databases — turning a web application vulnerability into a cloud infrastructure compromise.
+The attacker achieves three critical capabilities, each independently exploitable without authentication: mapping of the entire application route structure (including hidden/protected endpoints), bypassing server-side authentication on those routes, and reaching internal network services not exposed to the public internet. The SSRF pivot in particular can be used to access internal APIs, metadata services (e.g., AWS IMDS at `169.254.169.254`), or internal databases — turning a web application vulnerability into a cloud infrastructure compromise.
 
 ---
 
