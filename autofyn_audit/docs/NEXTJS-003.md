@@ -4,7 +4,7 @@
 **CWE:** CWE-770: Allocation of Resources Without Limits or Throttling
 **Ecosystem:** npm
 **Package Name:** next
-**Affected Versions:** Confirmed on 16.3.0-canary.29 (commit `007051470157d38058730ffa0a1983d4b4106424`); earlier versions not exhaustively tested
+**Affected Versions:** <= 16.3.0-canary.29
 **Patched Versions:** None
 
 > Discovered by [AutoFyn](https://github.com/SignalPilot-Labs/AutoFyn). Full audit: [audit_report.md](https://github.com/tempcollab/next.js/blob/canary/autofyn_audit/audit_report.md)
